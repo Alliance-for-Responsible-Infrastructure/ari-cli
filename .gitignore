@@ -2,3 +2,6 @@ node_modules
 package-lock.json
 .DS_Store
 .env
+
+# Internal working notes — intentionally unversioned (this repo is public).
+/references/
