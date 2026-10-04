@@ -1,0 +1,36 @@
+{
+    "name": "ari-cli",
+    "version": "0.1.0",
+    "description": "CLI for authenticating with and managing ARI (Alliance for Responsible Infrastructure) AWS accounts.",
+    "main": "index.js",
+    "bin": {
+        "ari": "./index.js"
+    },
+    "scripts": {
+        "lint": "eslint .",
+        "format": "prettier --write .",
+        "test": "yarn lint && node --experimental-vm-modules node_modules/jest/bin/jest.js --setupFiles dotenv/config"
+    },
+    "imports": {
+        "#src/*": "./src/*"
+    },
+    "type": "module",
+    "repository": "git@github.com:Alliance-for-Responsible-Infrastructure/ari-cli.git",
+    "author": "",
+    "license": "ISC",
+    "dependencies": {
+        "@aws-sdk/client-sts": "^3.687.0",
+        "@aws-sdk/credential-providers": "^3.687.0",
+        "commander": "^12.1.0",
+        "picocolors": "^1.1.1",
+        "semver": "^7.6.3"
+    },
+    "devDependencies": {
+        "@eslint/js": "^9.17.0",
+        "dotenv": "^16.4.5",
+        "eslint": "^9.29.0",
+        "globals": "^15.14.0",
+        "jest": "^29.7.0",
+        "prettier": "^3.5.3"
+    }
+}

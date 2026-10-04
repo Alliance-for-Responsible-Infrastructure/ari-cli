@@ -1,0 +1,11 @@
+{
+    "credentials": {
+        "defaultRole": "ViewOnlyAccess",
+        "roles": ["AdministratorAccess", "ViewOnlyAccess"],
+        "accounts": {
+            "management": { "name": "ARI Management" },
+            "controlled": { "name": "ari-controlled" },
+            "public": { "name": "ari-public" }
+        }
+    }
+}
