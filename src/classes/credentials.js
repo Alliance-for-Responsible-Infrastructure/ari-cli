@@ -1,9 +1,8 @@
 import { styles } from '#src/lib/cli/terminal.js';
 import {
-    configureSsoProfile,
+    isSsoSessionValid,
     ssoLogin,
     getCredentials,
-    isCredentialValid,
     writeDefaultCredentials,
     verifyCredentials,
 } from '#src/lib/cli/aws.js';
@@ -96,33 +95,19 @@ export default class CredentialsCommand extends BaseAriCommand {
         }
     }
 
-    async executeSetupProfile() {
-        this.#log(emphasis('Configuring SSO profile:'), this.profileName);
-        await configureSsoProfile(this.profileName, {
-            accountId: this.accountId,
-            roleName: this.roleName,
-            ssoStartUrl: this.ssoStartUrl,
-            ssoRegion: this.ssoRegion,
-        });
-        this.#log(success('Profile configured.'));
-    }
-
     async executeLogin() {
-        if (!this.options.force) {
-            const valid = await isCredentialValid(this.profileName);
-            if (valid) {
-                this.#log(
-                    success('Session active.'),
-                    'Skipping SSO login — cached credentials are still valid.',
-                );
-                return;
-            }
+        if (!this.options.force && isSsoSessionValid(this.ssoStartUrl)) {
+            this.#log(
+                success('Session active.'),
+                'Skipping SSO login — cached session is still valid.',
+            );
+            return;
         }
-        this.#log(emphasis('Opening AWS SSO login...'));
-        this.#log(
-            'A verification code will appear below — confirm it matches the code shown in the browser before approving.',
-        );
-        await ssoLogin(this.profileName, { useStderr: this.options.print });
+        this.#log(emphasis('Opening AWS SSO login in your browser...'));
+        await ssoLogin(this.ssoStartUrl, this.ssoRegion, {
+            force: this.options.force,
+            log: (...args) => this.#log(...args),
+        });
     }
 
     async executeHandleCredentials() {
@@ -141,11 +126,16 @@ export default class CredentialsCommand extends BaseAriCommand {
      */
     async #fetchCredentials() {
         try {
-            return await getCredentials(this.profileName);
+            return await getCredentials({
+                ssoStartUrl: this.ssoStartUrl,
+                ssoRegion: this.ssoRegion,
+                accountId: this.accountId,
+                roleName: this.roleName,
+            });
         } catch (e) {
             if (
-                e.message?.includes('ForbiddenException') ||
-                e.message?.includes('No access')
+                e.name === 'UnauthorizedException' ||
+                e.message?.includes('not authorized')
             ) {
                 console.error(
                     error('Error:'),
@@ -239,7 +229,6 @@ export default class CredentialsCommand extends BaseAriCommand {
         if (!this.options.print) {
             super.addActions();
         }
-        this.addAction(this.executeSetupProfile);
         this.addAction(this.executeLogin);
         this.addAction(this.executeHandleCredentials);
     }

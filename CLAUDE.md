@@ -25,7 +25,10 @@ node --experimental-vm-modules node_modules/jest/bin/jest.js --setupFiles dotenv
 **ari-cli** is a Commander.js CLI that shrinks the AWS surface area for ARI (Alliance for Responsible
 Infrastructure) collaborators who mostly don't know AWS tooling. It wraps AWS IAM Identity Center
 SSO login + credential activation behind a single `ari credentials` command. It's a pure ES modules
-project (`"type": "module"`) requiring Node v22 (see `.nvmrc`).
+project (`"type": "module"`) requiring Node v22 (see `.nvmrc`) — and nothing else; the SSO login and
+credential fetch are done directly via the AWS SDK (`@aws-sdk/client-sso-oidc`, `@aws-sdk/client-sso`),
+not by shelling out to the `aws` CLI, so there's no separate AWS CLI install for collaborators to get
+right.
 
 This repo is public and intentionally contains **no org-specific AWS details** — account IDs, the
 SSO start URL, and the SSO region are never committed here. `ari-config.json` (shipped with the
@@ -61,7 +64,7 @@ src/
     local-config.js      # ~/.ari/config.json read/write (org-specific, never committed)
     cli/
       terminal.js        # picocolors-based styles (success/error/warn/emphasis/bold)
-      aws.js             # SSO login/profile/credential/verify helpers (AWS-SDK + aws CLI subprocess)
+      aws.js             # SSO device-flow login, role credential fetch/verify/write — pure AWS SDK
 
 tests/
   classes/     # Jest tests mirroring src/classes
@@ -100,8 +103,18 @@ code change. Adding a new account still requires each user to add its account ID
 
 ### CLI Utilities (`src/lib/cli/`)
 
-`aws.js` (SSO login, profile setup, credential fetch/verify/write via `aws` CLI subprocess + AWS SDK
-STS client), `terminal.js` (styled output via `picocolors`).
+`aws.js` — the whole SSO flow via AWS SDK clients, no `aws` CLI subprocess anywhere:
+
+- `ssoLogin`/`isSsoSessionValid`: OIDC device-authorization flow (`@aws-sdk/client-sso-oidc`) with
+  a local token cache at `~/.aws/sso/cache/<sha1(startUrl)>.json` — the same location/format AWS CLI
+  v2 uses, so a session started by either is recognized by the other.
+- `getCredentials`: `sso:GetRoleCredentials` (`@aws-sdk/client-sso`) using the cached access token —
+  no `~/.aws/config` SSO profile needed.
+- `verifyCredentials`: `sts:GetCallerIdentity` (`@aws-sdk/client-sts`).
+- `writeDefaultCredentials`: a small hand-rolled INI reader/writer for `~/.aws/credentials` (no
+  `aws configure set` subprocess).
+
+`terminal.js` (styled output via `picocolors`).
 
 ### Import Alias
 

@@ -1,156 +1,206 @@
-import { exec, spawn } from 'child_process';
+import crypto from 'crypto';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
-import { fromSSO } from '@aws-sdk/credential-providers';
+import {
+    SSOOIDCClient,
+    RegisterClientCommand,
+    StartDeviceAuthorizationCommand,
+    CreateTokenCommand,
+} from '@aws-sdk/client-sso-oidc';
+import { SSOClient, GetRoleCredentialsCommand } from '@aws-sdk/client-sso';
+import open from 'open';
 
-/**
- * Attempt to login to AWS via SSO, streaming output in real-time so the
- * verification code printed by the AWS CLI is visible before the user approves
- * in the browser.
- *
- * In --print mode (useStderr: true) all output is routed to stderr so that
- * stdout stays clean for shell evaluation: eval $(ari credentials --print)
- *
- * @param {string} profile - the aws profile to login as
- * @param {Object} [options]
- * @param {boolean} [options.useStderr=false] - route all output to stderr
- * @returns {Promise<void>}
- */
-export function ssoLogin(profile, { useStderr = false } = {}) {
-    return new Promise((resolve, reject) => {
-        const child = spawn('aws', ['sso', 'login', '--profile', profile], {
-            stdio: useStderr
-                ? ['ignore', 'pipe', 'pipe']
-                : ['ignore', 'inherit', 'inherit'],
-        });
+const OIDC_CLIENT_NAME = 'ari-cli';
+const OIDC_CLIENT_TYPE = 'public';
+// Required for the resulting access token to be usable against the SSO
+// portal API (sso:ListAccounts / sso:GetRoleCredentials).
+const OIDC_SCOPES = ['sso:account:access'];
 
-        if (useStderr) {
-            child.stdout?.on('data', (data) => process.stderr.write(data));
-            child.stderr?.on('data', (data) => process.stderr.write(data));
-        }
+// Same cache location/format AWS CLI v2 uses for `aws sso login` — reading
+// and writing here means an SSO session started with the AWS CLI (if it's
+// ever installed) is recognized by ari-cli, and vice versa.
+function ssoCacheDir() {
+    return path.join(os.homedir(), '.aws', 'sso', 'cache');
+}
 
-        child.on('close', (code) => {
-            if (code === 0) resolve();
-            else reject(new Error(`aws sso login failed with code ${code}`));
-        });
+function ssoCacheFile(ssoStartUrl) {
+    const hash = crypto.createHash('sha1').update(ssoStartUrl).digest('hex');
+    return path.join(ssoCacheDir(), `${hash}.json`);
+}
 
-        child.on('error', reject);
+function readSsoCache(ssoStartUrl) {
+    const file = ssoCacheFile(ssoStartUrl);
+    if (!fs.existsSync(file)) return null;
+    try {
+        return JSON.parse(fs.readFileSync(file, 'utf-8'));
+    } catch {
+        return null;
+    }
+}
+
+function writeSsoCache(ssoStartUrl, data) {
+    const dir = ssoCacheDir();
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(ssoCacheFile(ssoStartUrl), JSON.stringify(data, null, 2), {
+        mode: 0o600,
     });
 }
 
-/**
- * Idempotently write an AWS SSO profile to ~/.aws/config using `aws configure set`.
- * Safe to call multiple times — subsequent calls overwrite the previous values.
- *
- * @param {string} profileName - the profile name to write (e.g. "ari-public-ViewOnlyAccess")
- * @param {Object} config
- * @param {string} config.accountId    - AWS account ID
- * @param {string} config.roleName     - IAM role name
- * @param {string} config.ssoStartUrl  - IAM Identity Center start URL
- * @param {string} config.ssoRegion    - region where IAM Identity Center is hosted
- * @returns {Promise<void>}
- */
-export async function configureSsoProfile(
-    profileName,
-    { accountId, roleName, ssoStartUrl, ssoRegion },
-) {
-    const settings = [
-        ['sso_start_url', ssoStartUrl],
-        ['sso_region', ssoRegion],
-        ['sso_account_id', accountId],
-        ['sso_role_name', roleName],
-        ['region', ssoRegion],
-        ['output', 'json'],
-    ];
+function isNotExpired(isoTimestamp, skewMs = 60_000) {
+    return (
+        !!isoTimestamp && new Date(isoTimestamp).getTime() > Date.now() + skewMs
+    );
+}
 
-    for (const [key, value] of settings) {
-        await new Promise((resolve, reject) => {
-            exec(
-                `aws configure set ${key} "${value}" --profile "${profileName}"`,
-                (err, _, stderr) => {
-                    if (err) reject(new Error(stderr || err.message));
-                    else resolve();
-                },
+/**
+ * Whether there's a cached SSO access token that's still valid — no network
+ * call, just a local file + expiry check.
+ * @param {string} ssoStartUrl
+ * @returns {boolean}
+ */
+export function isSsoSessionValid(ssoStartUrl) {
+    const cached = readSsoCache(ssoStartUrl);
+    return isNotExpired(cached?.expiresAt);
+}
+
+/**
+ * Ensures a valid cached SSO access token exists, performing the OIDC device
+ * authorization flow (in-process, via the AWS SDK — no `aws` CLI required)
+ * if there's no valid cached session. Opens the verification URL in the
+ * user's browser and polls until they approve it.
+ *
+ * @param {string} ssoStartUrl
+ * @param {string} ssoRegion
+ * @param {Object} [options]
+ * @param {boolean} [options.force=false] - skip the cache and force a fresh login
+ * @param {(...args: any[]) => void} [options.log=console.log]
+ * @returns {Promise<string>} the (possibly newly obtained) access token
+ */
+export async function ssoLogin(
+    ssoStartUrl,
+    ssoRegion,
+    { force = false, log = console.log } = {},
+) {
+    if (!force) {
+        const cached = readSsoCache(ssoStartUrl);
+        if (isNotExpired(cached?.expiresAt)) return cached.accessToken;
+    }
+
+    const oidc = new SSOOIDCClient({ region: ssoRegion });
+
+    const client = await oidc.send(
+        new RegisterClientCommand({
+            clientName: OIDC_CLIENT_NAME,
+            clientType: OIDC_CLIENT_TYPE,
+            scopes: OIDC_SCOPES,
+        }),
+    );
+
+    const deviceAuth = await oidc.send(
+        new StartDeviceAuthorizationCommand({
+            clientId: client.clientId,
+            clientSecret: client.clientSecret,
+            startUrl: ssoStartUrl,
+        }),
+    );
+
+    log(`Verification code: ${deviceAuth.userCode}`);
+    log(
+        `Opening ${deviceAuth.verificationUriComplete} — approve the request there.`,
+    );
+    await open(deviceAuth.verificationUriComplete);
+
+    let intervalMs = (deviceAuth.interval || 5) * 1000;
+    const deadline = Date.now() + (deviceAuth.expiresIn || 600) * 1000;
+
+    for (;;) {
+        if (Date.now() >= deadline) {
+            throw new Error('Timed out waiting for SSO login approval.');
+        }
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+
+        try {
+            const token = await oidc.send(
+                new CreateTokenCommand({
+                    clientId: client.clientId,
+                    clientSecret: client.clientSecret,
+                    grantType: 'urn:ietf:params:oauth:grant-type:device_code',
+                    deviceCode: deviceAuth.deviceCode,
+                }),
             );
-        });
+
+            const expiresAt = new Date(
+                Date.now() + token.expiresIn * 1000,
+            ).toISOString();
+            writeSsoCache(ssoStartUrl, {
+                startUrl: ssoStartUrl,
+                region: ssoRegion,
+                accessToken: token.accessToken,
+                expiresAt,
+            });
+            return token.accessToken;
+        } catch (e) {
+            if (e.name === 'AuthorizationPendingException') continue;
+            if (e.name === 'SlowDownException') {
+                intervalMs += 5000;
+                continue;
+            }
+            if (e.name === 'AccessDeniedException') {
+                throw new Error('Login request was declined.');
+            }
+            if (e.name === 'ExpiredTokenException') {
+                throw new Error(
+                    'The login request expired before it was approved.',
+                );
+            }
+            throw e;
+        }
     }
 }
 
 /**
- * Resolve fresh credentials for a named SSO profile via the AWS SSO service.
- * Uses fromSSO which reads the SSO config from ~/.aws/config and always calls
- * the SSO service to get current role credentials — bypassing ~/.aws/credentials
- * entirely so stale static credentials written by a previous run cannot
- * interfere.
+ * Fetches short-term role credentials directly from the SSO portal API,
+ * using a cached access token (see ssoLogin). Throws if there's no valid
+ * cached session — callers should run ssoLogin first.
  *
- * @param {string} profileName
+ * @param {Object} params
+ * @param {string} params.ssoStartUrl
+ * @param {string} params.ssoRegion
+ * @param {string} params.accountId
+ * @param {string} params.roleName
  * @returns {Promise<{AccessKeyId: string, SecretAccessKey: string, SessionToken: string, Expiration?: string}>}
  */
-export async function getCredentials(profileName) {
-    const provider = fromSSO({ profile: profileName });
-    const creds = await provider();
+export async function getCredentials({
+    ssoStartUrl,
+    ssoRegion,
+    accountId,
+    roleName,
+}) {
+    const cached = readSsoCache(ssoStartUrl);
+    if (!isNotExpired(cached?.expiresAt)) {
+        throw new Error(
+            'No active SSO session — run `ari credentials` again to log in.',
+        );
+    }
+
+    const sso = new SSOClient({ region: ssoRegion });
+    const { roleCredentials } = await sso.send(
+        new GetRoleCredentialsCommand({
+            accessToken: cached.accessToken,
+            accountId,
+            roleName,
+        }),
+    );
+
     return {
-        AccessKeyId: creds.accessKeyId,
-        SecretAccessKey: creds.secretAccessKey,
-        SessionToken: creds.sessionToken,
-        Expiration: creds.expiration?.toISOString(),
+        AccessKeyId: roleCredentials.accessKeyId,
+        SecretAccessKey: roleCredentials.secretAccessKey,
+        SessionToken: roleCredentials.sessionToken,
+        Expiration: new Date(roleCredentials.expiration).toISOString(),
     };
-}
-
-/**
- * Check whether the SSO session for a profile is still valid without opening
- * a browser. fromSSO calls the SSO service using the cached SSO token; if the
- * token is expired it throws, which we catch and return false.
- *
- * @param {string} profileName
- * @returns {Promise<boolean>}
- */
-export async function isCredentialValid(profileName) {
-    try {
-        const provider = fromSSO({ profile: profileName });
-        await provider();
-        return true;
-    } catch {
-        return false;
-    }
-}
-
-/**
- * Write temporary STS credentials into ~/.aws/credentials using `aws configure set`.
- * Omit profileName (or pass null) to write to [default]; pass a profile name to
- * write to a named profile. Writing to a named SSO profile overlays static
- * credentials on top of its SSO config so that tools that don't auto-refresh SSO
- * still receive valid credentials regardless of AWS_PROFILE.
- *
- * @param {Object} creds
- * @param {string} creds.AccessKeyId
- * @param {string} creds.SecretAccessKey
- * @param {string} creds.SessionToken
- * @param {string|null} [profileName=null] - target profile; null → [default]
- * @returns {Promise<void>}
- */
-export async function writeDefaultCredentials(
-    { AccessKeyId, SecretAccessKey, SessionToken },
-    profileName = null,
-) {
-    const profileFlag = profileName ? ` --profile "${profileName}"` : '';
-    const entries = [
-        ['aws_access_key_id', AccessKeyId],
-        ['aws_secret_access_key', SecretAccessKey],
-        ['aws_session_token', SessionToken],
-    ];
-
-    for (const [key, value] of entries) {
-        await new Promise((resolve, reject) => {
-            exec(
-                `aws configure set ${key} "${value}"${profileFlag}`,
-                (err, _, stderr) => {
-                    if (err) reject(new Error(stderr || err.message));
-                    else resolve();
-                },
-            );
-        });
-    }
 }
 
 /**
@@ -183,6 +233,74 @@ export async function verifyCredentials({
     } catch (e) {
         return { valid: false, error: e.message };
     }
+}
+
+// --- ~/.aws/credentials (INI) read/write, no `aws` CLI required ---
+
+function parseIni(content) {
+    const sections = {};
+    let current = null;
+    for (const rawLine of content.split('\n')) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#') || line.startsWith(';')) continue;
+        const sectionMatch = line.match(/^\[(.+)\]$/);
+        if (sectionMatch) {
+            current = sectionMatch[1];
+            sections[current] ??= {};
+            continue;
+        }
+        const kv = line.match(/^([^=]+)=(.*)$/);
+        if (kv && current) {
+            sections[current][kv[1].trim()] = kv[2].trim();
+        }
+    }
+    return sections;
+}
+
+function stringifyIni(sections) {
+    const lines = [];
+    for (const [section, kv] of Object.entries(sections)) {
+        lines.push(`[${section}]`);
+        for (const [key, value] of Object.entries(kv)) {
+            lines.push(`${key} = ${value}`);
+        }
+        lines.push('');
+    }
+    return lines.join('\n');
+}
+
+function credentialsFilePath() {
+    return path.join(os.homedir(), '.aws', 'credentials');
+}
+
+/**
+ * Write temporary STS-style credentials into ~/.aws/credentials, preserving
+ * any other profiles already in the file. Omit profileName (or pass null)
+ * to write to [default]; pass a profile name to write to a named section.
+ *
+ * @param {Object} creds
+ * @param {string} creds.AccessKeyId
+ * @param {string} creds.SecretAccessKey
+ * @param {string} creds.SessionToken
+ * @param {string|null} [profileName=null] - target profile; null → [default]
+ */
+export function writeDefaultCredentials(
+    { AccessKeyId, SecretAccessKey, SessionToken },
+    profileName = null,
+) {
+    const filePath = credentialsFilePath();
+    const sections = fs.existsSync(filePath)
+        ? parseIni(fs.readFileSync(filePath, 'utf-8'))
+        : {};
+
+    sections[profileName || 'default'] = {
+        aws_access_key_id: AccessKeyId,
+        aws_secret_access_key: SecretAccessKey,
+        aws_session_token: SessionToken,
+    };
+
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, stringifyIni(sections), { mode: 0o600 });
 }
 
 /**

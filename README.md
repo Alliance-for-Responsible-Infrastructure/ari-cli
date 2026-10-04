@@ -5,8 +5,8 @@ accounts without needing to know AWS tooling in detail.
 
 ## Prerequisites
 
-- [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) installed and on your `PATH`.
-- Node.js v22 (see `.nvmrc`).
+- Node.js v22 (see `.nvmrc`). That's it — no AWS CLI install required; `ari-cli` talks to AWS
+  directly via the AWS SDK.
 
 ## Install
 
@@ -53,9 +53,10 @@ ari credentials --account management --role AdministratorAccess
 ari credentials --account controlled --force
 ```
 
-This opens an AWS SSO login in your browser (first run, or after your session expires), then writes
-the resulting credentials to `~/.aws/credentials` so any AWS CLI command, SDK, or tool just works —
-no `AWS_PROFILE` juggling required.
+This opens an AWS SSO login in your browser (first run, or after your session expires) — you'll see
+a code in the terminal, confirm it matches what's shown in the browser, then approve. `ari-cli` then
+writes the resulting credentials to `~/.aws/credentials` so any AWS CLI command, SDK, or tool just
+works — no `AWS_PROFILE` juggling required (and no need to have the AWS CLI installed at all).
 
 ### Scripting
 

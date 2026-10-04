@@ -2,7 +2,7 @@
  * Tests for CredentialsCommand — account/role resolution and command
  * sequencing for `ari credentials`. All AWS/SSO calls are mocked.
  */
-import { jest, describe, expect, test } from '@jest/globals';
+import { jest, describe, expect, test, afterEach } from '@jest/globals';
 
 jest.unstable_mockModule('#src/lib/version-check.js', () => ({
     default: jest.fn().mockResolvedValue(undefined),
@@ -23,16 +23,15 @@ jest.unstable_mockModule('#src/lib/local-config.js', () => ({
 }));
 
 jest.unstable_mockModule('#src/lib/cli/aws.js', () => ({
-    configureSsoProfile: jest.fn().mockResolvedValue(undefined),
-    ssoLogin: jest.fn().mockResolvedValue(undefined),
+    isSsoSessionValid: jest.fn(() => false),
+    ssoLogin: jest.fn().mockResolvedValue('fake-access-token'),
     getCredentials: jest.fn().mockResolvedValue({
         AccessKeyId: 'AKIAEXAMPLE',
         SecretAccessKey: 'secret',
         SessionToken: 'token',
         Expiration: '2026-01-01T00:00:00.000Z',
     }),
-    isCredentialValid: jest.fn().mockResolvedValue(false),
-    writeDefaultCredentials: jest.fn().mockResolvedValue(undefined),
+    writeDefaultCredentials: jest.fn(),
     verifyCredentials: jest.fn().mockResolvedValue({
         valid: true,
         arn: 'arn:aws:iam::123456789012:user/me',
@@ -40,8 +39,14 @@ jest.unstable_mockModule('#src/lib/cli/aws.js', () => ({
 }));
 
 const { readLocalConfig } = await import('#src/lib/local-config.js');
+const { isSsoSessionValid, ssoLogin, getCredentials } =
+    await import('#src/lib/cli/aws.js');
 const { default: CredentialsCommand } =
     await import('#src/classes/credentials.js');
+
+afterEach(() => {
+    jest.clearAllMocks();
+});
 
 describe('CredentialsCommand — account/role resolution', () => {
     test('resolves profileName from account + explicit role', () => {
@@ -75,7 +80,6 @@ describe('CredentialsCommand — action queue', () => {
         const names = cmd.cmdQueue.map((f) => f.name);
         expect(names).toEqual([
             'executeVersionCheck',
-            'executeSetupProfile',
             'executeLogin',
             'executeHandleCredentials',
         ]);
@@ -84,11 +88,7 @@ describe('CredentialsCommand — action queue', () => {
     test('--print mode skips the version check', () => {
         const cmd = new CredentialsCommand({ account: 'public', print: true });
         const names = cmd.cmdQueue.map((f) => f.name);
-        expect(names).toEqual([
-            'executeSetupProfile',
-            'executeLogin',
-            'executeHandleCredentials',
-        ]);
+        expect(names).toEqual(['executeLogin', 'executeHandleCredentials']);
     });
 });
 
@@ -139,5 +139,65 @@ describe('CredentialsCommand — missing local config', () => {
 
         exitSpy.mockRestore();
         logSpy.mockRestore();
+    });
+});
+
+describe('CredentialsCommand — SSO session handling', () => {
+    test('skips ssoLogin when a cached session is already valid', async () => {
+        isSsoSessionValid.mockReturnValueOnce(true);
+        const cmd = new CredentialsCommand({ account: 'public' });
+        await cmd.execute();
+        expect(ssoLogin).not.toHaveBeenCalled();
+    });
+
+    test('calls ssoLogin when there is no valid cached session', async () => {
+        isSsoSessionValid.mockReturnValueOnce(false);
+        const cmd = new CredentialsCommand({ account: 'public' });
+        await cmd.execute();
+        expect(ssoLogin).toHaveBeenCalledWith(
+            'https://d-example.awsapps.com/start',
+            'us-east-1',
+            expect.objectContaining({ force: undefined }),
+        );
+    });
+
+    test('--force bypasses a valid cached session', async () => {
+        isSsoSessionValid.mockReturnValueOnce(true);
+        const cmd = new CredentialsCommand({ account: 'public', force: true });
+        await cmd.execute();
+        expect(ssoLogin).toHaveBeenCalledWith(
+            'https://d-example.awsapps.com/start',
+            'us-east-1',
+            expect.objectContaining({ force: true }),
+        );
+    });
+});
+
+describe('CredentialsCommand — unauthorized role access', () => {
+    test('exits with a friendly message instead of a raw AWS error', async () => {
+        getCredentials.mockRejectedValueOnce(
+            Object.assign(new Error('User is not authorized'), {
+                name: 'UnauthorizedException',
+            }),
+        );
+        const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {
+            throw new Error('process.exit');
+        });
+        const errorSpy = jest
+            .spyOn(console, 'error')
+            .mockImplementation(() => {});
+
+        const cmd = new CredentialsCommand({ account: 'public' });
+        await expect(cmd.execute()).rejects.toThrow('process.exit');
+
+        expect(exitSpy).toHaveBeenCalledWith(1);
+        expect(
+            errorSpy.mock.calls
+                .flat()
+                .some((arg) => String(arg).includes('ari-public')),
+        ).toBe(true);
+
+        exitSpy.mockRestore();
+        errorSpy.mockRestore();
     });
 });

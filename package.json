@@ -19,9 +19,11 @@
     "author": "",
     "license": "ISC",
     "dependencies": {
+        "@aws-sdk/client-sso": "^3.687.0",
+        "@aws-sdk/client-sso-oidc": "^3.687.0",
         "@aws-sdk/client-sts": "^3.687.0",
-        "@aws-sdk/credential-providers": "^3.687.0",
         "commander": "^12.1.0",
+        "open": "^10.1.0",
         "picocolors": "^1.1.1",
         "semver": "^7.6.3"
     },
