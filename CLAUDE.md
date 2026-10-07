@@ -102,12 +102,13 @@ code change. Adding a new account still requires each user to add its account ID
 
 `ari pipeline run <name>` / `ari pipeline status <name> <runId>` / `ari pipeline deploy <name>`
 (step 9 of the plan in `ari-cli/references/project-notes.md`) — generic over any pipeline built on
-`ari-iac` (e.g. `ari-pipeline-bedrock-docs`). Deliberately carries zero pipeline-specific logic —
-no knowledge of what a pipeline's workers do, its data shape, or its DynamoDB schema — same
-"stay generic" principle `credentials` follows for AWS services.
+`ari-iac` (e.g. `ari-pipeline-contingency-analysis-data`, the first real one). Deliberately carries
+zero pipeline-specific logic — no knowledge of what a pipeline's workers do, its data shape, or its
+DynamoDB schema — same "stay generic" principle `credentials` follows for AWS services.
 
-- `run` / `status` resolve `<name>` (a pipeline's `projectName`, e.g. `dev-bedrock-docs`) to a
-  state machine ARN via one `ssm:GetParameter` call at `/ari/pipelines/<name>/stateMachineArn` —
+- `run` / `status` resolve `<name>` (a pipeline's `projectName`, e.g.
+  `production-ari-pipeline-contingency-analysis-data`) to a state machine ARN via one
+  `ssm:GetParameter` call at `/ari/pipelines/<name>/stateMachineArn` —
   the named-pipeline registry every `ari-iac`-built pipeline stack declares as a plain CDK
   resource (no separate registration step, nothing to keep in sync). `--region` (default
   `us-east-1`) is required because there's no pipeline → account/region mapping anywhere; a

@@ -70,29 +70,31 @@ eval $(ari credentials --account public --print)
 ### Named pipelines
 
 A "pipeline" is a named, independently deployed stack built on `ari-iac` (e.g. ARI's Bedrock
-parse/verify/filter document pipeline, `ari-pipeline-bedrock-docs`). `ari-cli` stays generic here —
-it only knows how to start/check an execution by name, not what any pipeline actually does.
+parse/verify/filter document pipeline, `ari-pipeline-contingency-analysis-data`). `ari-cli` stays
+generic here — it only knows how to start/check an execution by name, not what any pipeline
+actually does.
 
 ```bash
 # Start a run — generates a runId and prints it back to you
-ari pipeline run dev-bedrock-docs
+ari pipeline run production-ari-pipeline-contingency-analysis-data
 
 # Check a run's status
-ari pipeline status dev-bedrock-docs run-20261004120000-abc123
+ari pipeline status production-ari-pipeline-contingency-analysis-data run-20261004120000-abc123
 
 # Deploy a pipeline's stack — run from inside that pipeline's own repo directory
-ari pipeline deploy dev-bedrock-docs
+ari pipeline deploy production-ari-pipeline-contingency-analysis-data
 
 # Reuse a specific runId (e.g. one you already loaded data under) instead of a generated one
-ari pipeline run dev-bedrock-docs --run-id poc-001
+ari pipeline run production-ari-pipeline-contingency-analysis-data --run-id poc-001
 ```
 
 `<name>` is the pipeline's `projectName` (`{environment}-{workloadName}` from its own
-`config/default.json`, e.g. `dev-bedrock-docs`) — `run`/`status` resolve it to a state machine ARN
-via an SSM parameter (`/ari/pipelines/<name>/stateMachineArn`) that pipeline's own stack declares;
-there's no separate registration step. Pass `--region` if the pipeline isn't deployed in
-`us-east-1` (the default). `status` reports the Step Functions execution's own status — for
-per-file detail, check that pipeline's own CloudWatch logs or state table. `deploy` must be run
+`config/default.json`, e.g. `production-ari-pipeline-contingency-analysis-data`) — `run`/`status`
+resolve it to a state machine ARN via an SSM parameter (`/ari/pipelines/<name>/stateMachineArn`)
+that pipeline's own stack declares; there's no separate registration step. Pass `--region` if the
+pipeline isn't deployed in `us-east-1` (the default). `status` reports the Step Functions
+execution's own status — for per-file detail, check that pipeline's own CloudWatch logs or state
+table. `deploy` must be run
 from inside the named pipeline's own repo directory — it reads that repo's own
 `config/default.json` to confirm `<name>` matches, then shells `npx cdk deploy` with its output
 and any interactive prompts passed straight through.
