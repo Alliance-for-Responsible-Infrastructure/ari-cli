@@ -20,6 +20,7 @@
     "license": "ISC",
     "dependencies": {
         "@aws-sdk/client-cloudwatch-logs": "^3.687.0",
+        "@aws-sdk/client-s3": "^3.687.0",
         "@aws-sdk/client-sfn": "^3.687.0",
         "@aws-sdk/client-ssm": "^3.687.0",
         "@aws-sdk/client-sso": "^3.687.0",

@@ -116,6 +116,38 @@ lines are shown (START/END/REPORT figures, the per-invocation metric line, error
 by `[line withheld ...]`, so log content can never leak. Lambda platform lines carry no run id, so they are selected
 by the run's time window and concurrent runs may interleave (the command says so).
 
+#### Reading and loading pipeline data
+
+These commands are driven by the pipeline's **manifest** (`/ari/pipelines/<name>/manifest`, schema 1: stages with
+`loadable`/`readable` flags, `inputStage`, `resultKey`, `bucketName`, `classification`, `accountKey`), so they work
+from any directory. A pipeline deployed before the manifest existed fails with a "redeploy" message.
+
+```bash
+ari pipeline data stages <name>                                  # stages, prefixes, loadable/readable (no S3 call)
+ari pipeline data load <name> <localDir> --run-id <id> [--stage <s>] [--yes]   # upload top-level files to the input stage
+ari pipeline data ls <name> <runId> [--stage <s>] [--match <text>] [--ids] [--json]   # keys/sizes/dates only
+ari pipeline data inspect <name> <runId> <id> --stage <s> [--json]   # STRUCTURE ONLY: columns, row count, JSON key shape, sizes
+ari pipeline data cat <name> <runId> <id> --stage <s> [--max-bytes <n>] [--head <lines>] [--yes]   # gated
+ari pipeline data get <name> <runId> [<id>] [--stage <s>] [--out <path>] [--force] [--yes]         # gated; no id = result key
+ari pipeline fetch <name> <runId> [--out <path>] [--force] [--yes]                                 # gated; the manifest's resultKey
+```
+
+Prefer them in this order: `ls` / `inspect` (nothing printed or stored; `inspect` still reads the object in the CLI
+process, so it needs `s3:GetObject` and is recorded in CloudTrail), then `cat` (bounded, terminal), then `get`/`fetch`
+(a file on your machine).
+
+**The content gate** (`get`, `cat`, `fetch`) has no bypass: no environment variable, config setting or flag
+other than the per-call `--yes`. It (1) only allows stages the manifest marks `readable` (so not `raw/`), (2) prints a
+banner naming account, bucket, key, size, version id and your identity (the read is recorded in CloudTrail; the CLI
+keeps no log of its own), (3) asks y/N on a terminal, or requires `--yes` off one (exit 2 otherwise), (4) refuses
+binary objects (NUL bytes in the first 4 KiB), (5) for `cat` reads at most `--max-bytes` (default 64 KiB, hard cap
+1 MiB) with a ranged request, (6) writes downloads with mode `0600`, never overwrites without `--force`, and warns
+if the path is in a git work tree or a cloud-sync folder. `ls`, `inspect`, `stages`, `load` never print object
+content. Until the `AriPipelineOperator` permission set exists, these need `AdministratorAccess`.
+
+Account guard: the caller's account must equal the account in the state machine ARN **and**, when the manifest has an
+`accountKey`, the account id for that key in `~/.ari/config.json` (`ari init`).
+
 `<name>` is the pipeline's `projectName` (`{environment}-{workloadName}` from its own
 `config/default.json`, e.g. `production-ari-pipeline-contingency-analysis-data`) — `run`/`status`
 resolve it to a state machine ARN via an SSM parameter (`/ari/pipelines/<name>/stateMachineArn`)
