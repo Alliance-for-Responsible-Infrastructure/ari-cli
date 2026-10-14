@@ -88,6 +88,34 @@ ari pipeline deploy production-ari-pipeline-contingency-analysis-data
 ari pipeline run production-ari-pipeline-contingency-analysis-data --run-id poc-001
 ```
 
+#### Waiting, monitoring and stopping runs
+
+```bash
+# Start and wait for the result (exit code: 0 SUCCEEDED, 10 FAILED, 11 TIMED_OUT, 12 ABORTED)
+ari pipeline run <name> --wait [--interval 5] [--timeout 2h] [--json]
+ari pipeline wait <name> <runId>          # same loop for a run that is already going
+
+ari pipeline runs <name> [--status FAILED] [--limit 20 | --all] [--json]
+ari pipeline history <name> <runId> [--failed-only] [--show-cause] [--json]
+ari pipeline logs <name> <runId> [--source sfn|lambda|all] [--follow] [--since 15m] [--limit 200] [--full]
+ari pipeline stop <name> <runId> [--yes] [--cause <text>]
+ari pipeline status <name> <runId> [--show-output]
+```
+
+Exit codes: `0` success, `1` error, `2` usage error / refused by a safety gate, `3` `--timeout` reached (run
+still going), `4` credentials expired while waiting (run unaffected), `10`/`11`/`12` execution
+FAILED/TIMED_OUT/ABORTED, `130` Ctrl-C (which only stops *waiting*; the run is never stopped implicitly).
+`history` and `logs` print names, timings, attempt counts and error codes only, never step input/output;
+`status` hides the execution output unless `--show-output`; `stop` asks for confirmation (`--yes` off a
+terminal). Every command checks that your credentials are for the pipeline's own account.
+
+`logs --source sfn` (default) shows Step Functions events. `--source lambda` (and `all`) shows the step-runner
+Lambda logs: it reads the log group names from the pipeline's manifest (`/ari/pipelines/<name>/manifest`, written by
+`ari-iac`'s `PipelineRegistry`) and errors clearly if the pipeline hasn't been redeployed with one. Only fixed-format
+lines are shown (START/END/REPORT figures, the per-invocation metric line, error codes); any other line is replaced
+by `[line withheld ...]`, so log content can never leak. Lambda platform lines carry no run id, so they are selected
+by the run's time window and concurrent runs may interleave (the command says so).
+
 `<name>` is the pipeline's `projectName` (`{environment}-{workloadName}` from its own
 `config/default.json`, e.g. `production-ari-pipeline-contingency-analysis-data`) — `run`/`status`
 resolve it to a state machine ARN via an SSM parameter (`/ari/pipelines/<name>/stateMachineArn`)
