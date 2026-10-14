@@ -83,6 +83,11 @@ ari pipeline status production-ari-pipeline-contingency-analysis-data run-202610
 
 # Deploy a pipeline's stack — run from inside that pipeline's own repo directory
 ari pipeline deploy production-ari-pipeline-contingency-analysis-data
+# First deploy in a fresh account/region: bootstrap CDK first (asks to confirm)
+ari pipeline deploy production-ari-pipeline-contingency-analysis-data --bootstrap
+# Preview / synthesize with the same guards
+ari pipeline diff production-ari-pipeline-contingency-analysis-data
+ari pipeline synth production-ari-pipeline-contingency-analysis-data --quiet
 
 # Reuse a specific runId (e.g. one you already loaded data under) instead of a generated one
 ari pipeline run production-ari-pipeline-contingency-analysis-data --run-id poc-001
@@ -156,5 +161,13 @@ pipeline isn't deployed in `us-east-1` (the default). `status` reports the Step 
 execution's own status — for per-file detail, check that pipeline's own CloudWatch logs or state
 table. `deploy` must be run
 from inside the named pipeline's own repo directory — it reads that repo's own
-`config/default.json` to confirm `<name>` matches, then shells `npx cdk deploy` with its output
-and any interactive prompts passed straight through.
+`config/default.json` to confirm `<name>` matches (exit 2 otherwise), then applies an account guard
+before running `npx cdk deploy|diff|synth` with its output and prompts passed straight through: STS
+must report the account id that `~/.ari/config.json` holds for `iac.account` (fail closed if
+unmapped; switch with `ari credentials`), `AWS_REGION`/`AWS_DEFAULT_REGION` (if set) must equal
+`iac.region`, and `deploy`/`diff` require the account to be CDK-bootstrapped (SSM
+`/cdk-bootstrap/<qualifier>/version`; qualifier from `cdk.json` context, default `hnb659fds`) —
+otherwise exit 2 with `Run: ari pipeline deploy <name> --bootstrap`. `--require-approval
+<never|any-change|broadening>` passes through (`never` warns and needs `--yes` off a TTY). There is
+intentionally no `--region` or `--profile`: region comes from the repo's config and identity from
+`ari credentials`/`AWS_PROFILE`, so the guard has one source of truth.

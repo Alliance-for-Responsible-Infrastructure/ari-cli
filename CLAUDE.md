@@ -108,7 +108,7 @@ code change. Adding a new account still requires each user to add its account ID
 
 ### Pipeline commands
 
-`ari pipeline run <name>` / `ari pipeline status <name> <runId>` / `ari pipeline deploy <name>`
+`ari pipeline run <name>` / `ari pipeline status <name> <runId>` / `ari pipeline deploy <name>` (+ `diff`/`synth`)
 (step 9 of the plan in `ari-cli/references/project-notes.md`) — generic over any pipeline built on
 `ari-iac` (e.g. `ari-pipeline-contingency-analysis-data`, the first real one). Deliberately carries
 zero pipeline-specific logic — no knowledge of what a pipeline's workers do, its data shape, or its
@@ -131,112 +131,23 @@ DynamoDB schema — same "stay generic" principle `credentials` follows for AWS 
   `verify_status`, ...) — that would require knowing that pipeline's own schema, exactly the kind
   of pipeline-specific knowledge this command stays out of. Points the user at that pipeline's own
   CloudWatch logs / state table when the run failed.
-- `deploy` is a thin, cwd-based wrapper around `cdk deploy` — not a name → repo-path registry (that
-  registry problem doesn't need solving yet). Must be run from inside the named pipeline's own repo
-  directory: it reads that repo's own `./config/default.json` directly off disk (plain
-  `fs.readFileSync`, not the `config` npm package, which resolves relative to `ari-cli`'s own
-  install location rather than the caller's cwd) to compute
-  `projectName = "{environment}-{workloadName}"` and errors loudly if it doesn't match the given
-  `<name>` — a cheap "wrong directory" safety check. Then shells `npx cdk deploy` with `stdio:
-  'inherit'` so CDK's own interactive diff/approval prompts and output reach the user directly;
-  `ari-cli` does no AWS SDK work of its own here. `cdk bootstrap` is still a one-time, documented
-  manual prerequisite per AWS account — not detected or run by this command. See
-  `src/classes/pipeline.js` and `ari-cli/references/pipeline-cli-workflow-steps.md` (work breakdown
-  item 3) for the design discussion.
+- `deploy` / `diff` / `synth` are thin, cwd-based wrappers around `npx cdk <verb>` (spec C4) — not a
+  name → repo-path registry (decided: stay cwd-based). `PipelineDeployCommand`, `PipelineDiffCommand`
+  and `PipelineSynthCommand` share `PipelineCdkCommand` in `src/classes/pipeline.js`. Must be run from
+  inside the named pipeline's own repo directory: it reads that repo's own `./config/default.json`
+  directly off disk (plain `fs.readFileSync`, not the `config` npm package, which resolves relative
+  to `ari-cli`'s own install location) for `projectName`, `iac.account`, `iac.region`. Guards, all
+  exit 2 and all before cdk is spawned: name mismatch; `iac.account` unmapped in `~/.ari/config.json`
+  (fail closed); STS account != mapped id; `AWS_REGION`/`AWS_DEFAULT_REGION` set and != `iac.region`;
+  (deploy/diff) SSM `/cdk-bootstrap/<qualifier>/version` missing (qualifier from `cdk.json` context
+  `@aws-cdk/core:bootstrapQualifier`, validated, default `hnb659fds`). `deploy --bootstrap` confirms
+  (`--yes` off a TTY) then runs `cdk bootstrap aws://<acct>/<region>` before deploy.
+  `--require-approval` is a commander choice; `never` warns and needs `--yes` off a TTY. cdk is spawned
+  with `spawnSync`, a fixed allow-listed argv (no arbitrary passthrough), `stdio: 'inherit'`, and
+  `AWS_BEARER_TOKEN_BEDROCK` stripped from the env. No `--region`/`--profile` flags by design (single
+  source of truth for the guard). Helpers `getCallerAccount`/`getBootstrapVersion` are in
+  `src/lib/cli/aws.js`.
 
-#### Operator commands (`wait`, `runs`, `stop`, `history`, `logs`)
-
-Spec: `ari-cli/references/pipeline-operator-tooling-spec.md` (Phases 1 and 3 and `logs --source lambda` (task 2.7) are
-implemented; 3.9 — registering the `AriPipelineOperator` role in `ari-config.json` — waits for the permission set).
-
-- **Exit codes** (`EXIT` in `pipeline-utils.js`): 0 ok, 1 error, 2 usage/safety-gate refusal, 3 wait
-  timeout, 4 credentials expired mid-wait, 10/11/12 execution FAILED/TIMED_OUT/ABORTED, 130 Ctrl-C.
-  `runCommand()` exits with `e.exitCode ?? 1` on errors (throw `PipelineError`) and `cmd.exitCode ?? 0` on success.
-- **Account guard:** every command resolves through `resolvePipeline()` — SSM lookup, then STS
-  `GetCallerIdentity`; caller account must equal the account in the state machine ARN; prints
-  `[aws] account …` to stderr.
-- **Wait:** `waitForExecution()` and `followExecutionLogs()` share `pollLoop()`: transient errors back off
-  (x2, cap 60s, 5 consecutive -> error), expired credentials rebuild the client (re-reads
-  `~/.aws/credentials`) and retry once, first SIGINT stops waiting only (never `StopExecution`), second exits.
-  All lib functions take an injectable `deps` (client factories, `sleep`, `now`, `onSigint`, ...) — tests use
-  that instead of mocking the SDK.
-- **Protected data:** `foldHistory()` and `formatSfnLogEvent()` are allow-lists (names, types, timings, counts,
-  error codes); `input`/`output`/Map items are never read and `cause` only with `history --show-cause`.
-  History is fetched with `includeExecutionData: false`. `status` prints the execution output only with
-  `--show-output`. `stop` needs a TTY confirm or `--yes` (exit 2 otherwise). Keep tests with sentinel strings
-  proving no payload leaks when touching these.
-- `logs --source sfn` takes its log group from `DescribeStateMachine`. `--source lambda|all` reads the SSM manifest
-  `/ari/pipelines/<name>/manifest` (`getPipelineManifest()`: schema must be 1, needs `logGroups.lambda`; absent
-  parameter -> clear "redeploy" `PipelineError`, no guessing) and fetches those groups for `[startDate, stopDate+10s]`
-  with NO server-side pattern: every event goes through `classifyLambdaLogEvent()`, an allow-list that renders only
-  START/END/REPORT numbers, the EMF metric line (`METRIC step=… duration=…`, only if its `runId` matches; `fileId` is
-  never printed), `Invoke Error` -> error code only, timeout/runtime-exit figures, and replaces everything else with
-  `[line withheld …]`. Lambda platform lines carry no run id, so they are time-window based and the command prints an
-  interleave notice (stderr) once. `--follow` works for all sources via `followExecutionLogs({ sources })`.
-
-#### Data plane (`pipeline data …`, `pipeline fetch`)
-
-Generic over any pipeline via its manifest (`/ari/pipelines/<name>/manifest`, schema 1; `validateDataManifest()` in
-`manifest.js` fails closed on anything unexpected). ari-cli knows the key shape `{stage}/{runId}/{id}` and the stage
-flags, nothing about what stages contain; no command reads the pipeline's DynamoDB table.
-
-- **Guard:** `resolveDataPipeline()` = `resolvePipeline(..., { manifest: true })`: SSM ARN, STS caller account must equal
-  the state machine ARN's account; then the manifest is read/validated (no manifest -> "redeploy" `PipelineError`,
-  unknown schema -> "update ari-cli"; its `stateMachineArn` must equal the registry's); then, if `accountKey` is set, the
-  caller must equal `~/.ari/config.json` `accounts[accountKey].accountId` (missing mapping fails closed: "run ari init").
-  Prints `[aws] account <id> (<accountKey>), region <r>`.
-- **Content gate** (`content-gate.js`, used by `get`/`cat`/`fetch`; NO bypass of any kind: no env var, config or flag
-  except per-call `--yes`): readable allow-list from the manifest (`raw` is not readable, so not even `get` can fetch it),
-  non-TTY without `--yes` -> exit 2 *before any AWS call*, banner (classification, account, bucket, key, size, version,
-  caller ARN; every classification gets one) then y/N, `cat` default 64 KiB / hard cap 1 MiB via ranged `GetObject`
-  pinned to the HEAD's version id, binary (NUL in first 4 KiB) refused before anything is printed or the file exists,
-  files `0600` (exclusive create; `--force` to replace; `fchmod`), warnings for git work trees / cloud-sync folders,
-  content only to stdout (`cat`) or `--out`. Never log content; CloudTrail is the only record (no local audit log).
-- **`inspect`** reads bytes but only `data-inspect.js` touches them and it returns column names, counts, JSON key names
-  with value *types*, sizes -- never a value, and never a parser error message (those quote input). Only `.csv`/`.json`
-  are read; other types use `HeadObject` metadata only; objects over 64 MiB are not read. Sentinel-string tests in
-  `tests/lib/data-inspect.test.js` and `tests/classes/pipeline-data.test.js` keep this true -- extend them if you touch it.
-- `ls` (no `--stage` = per-stage counts), `stages`, `load` (loadable stages only, counts not file names, asks before
-  adding to a non-empty prefix) never print content. IDs/keys printed are sanitized of control characters.
-
-### Configuration Registry
-
-- `ari-config.json` (repo, public) — the three ARI account keys/friendly-names, allowed IAM roles,
-  default role. This is the first place to look when adding an account or role.
-- `~/.ari/config.json` (per-machine, local, created by `ari init`) — SSO start URL, SSO region, and
-  each account's actual AWS account ID. Never shipped, never committed.
-
-### CLI Utilities (`src/lib/cli/`)
-
-`aws.js` — the whole SSO flow via AWS SDK clients, no `aws` CLI subprocess anywhere:
-
-- `ssoLogin`/`isSsoSessionValid`: OIDC device-authorization flow (`@aws-sdk/client-sso-oidc`) with
-  a local token cache at `~/.aws/sso/cache/<sha1(startUrl)>.json` — the same location/format AWS CLI
-  v2 uses, so a session started by either is recognized by the other.
-- `getCredentials`: `sso:GetRoleCredentials` (`@aws-sdk/client-sso`) using the cached access token —
-  no `~/.aws/config` SSO profile needed.
-- `verifyCredentials`: `sts:GetCallerIdentity` (`@aws-sdk/client-sts`).
-- `writeDefaultCredentials`: a small hand-rolled INI reader/writer for `~/.aws/credentials` (no
-  `aws configure set` subprocess).
-
-`pipeline.js` — the named-pipeline registry lookup, Step Functions and CloudWatch Logs calls behind the
-`pipeline` commands, no `aws` CLI subprocess here either: `resolveStateMachineArn`, `resolvePipeline`
-(account guard), `generateRunId`, `startPipelineRun`, `executionArnFor`, `describePipelineRun`,
-`listPipelineRuns`, `stopPipelineRun`, `getExecutionHistory`, `waitForExecution`, `getStateMachineLogGroup`,
-`fetchExecutionLogs`, `followExecutionLogs`, `getPipelineManifest`, `fetchLambdaLogs`, and the data plane
-(`resolveDataPipeline`, `listDataObjects`, `dataPrefixHasObjects`, `listLocalFiles`, `uploadDataFiles`, `headDataObject`,
-`readDataObject`, `downloadDataObject`; `@aws-sdk/client-s3`). Unit-tested in `tests/lib/pipeline.test.js` via injected `deps`;
-mocked wholesale in `tests/classes/pipeline.test.js` when testing the command classes.
-
-`terminal.js` (styled output via `picocolors`).
-
-### Import Alias
-
-Use `#src/*` for imports from the `src/` directory (defined in `package.json` `imports` field).
-
-### Local Development
-
-Use `npm link` to test the CLI locally.
 
 ## Roadmap
 

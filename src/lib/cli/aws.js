@@ -4,6 +4,7 @@ import os from 'os';
 import path from 'path';
 
 import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
+import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import {
     SSOOIDCClient,
     RegisterClientCommand,
@@ -321,4 +322,42 @@ export function cleanAwsEnv() {
     delete env.AWS_PROFILE;
     delete env.AWS_DEFAULT_PROFILE;
     return env;
+}
+
+export const DEFAULT_BOOTSTRAP_QUALIFIER = 'hnb659fds';
+
+/**
+ * Account id of the current credentials (STS GetCallerIdentity; needs no IAM
+ * permission). `deps.createSts` overrides the client for tests.
+ * @param {string} region
+ * @param {{createSts?: () => {send: Function}}} [deps]
+ * @returns {Promise<string>}
+ */
+export async function getCallerAccount(region, deps = {}) {
+    const sts = (deps.createSts ?? (() => new STSClient({ region })))();
+    const { Account } = await sts.send(new GetCallerIdentityCommand({}));
+    return Account;
+}
+
+/**
+ * Reads the CDK bootstrap version from SSM
+ * (`/cdk-bootstrap/<qualifier>/version`).
+ * @param {string} qualifier
+ * @param {string} region
+ * @param {{createSsm?: () => {send: Function}}} [deps]
+ * @returns {Promise<string|null>} the version, or null if not bootstrapped
+ */
+export async function getBootstrapVersion(qualifier, region, deps = {}) {
+    const ssm = (deps.createSsm ?? (() => new SSMClient({ region })))();
+    try {
+        const { Parameter } = await ssm.send(
+            new GetParameterCommand({
+                Name: `/cdk-bootstrap/${qualifier}/version`,
+            }),
+        );
+        return Parameter?.Value ?? null;
+    } catch (e) {
+        if (e?.name === 'ParameterNotFound') return null;
+        throw e;
+    }
 }
