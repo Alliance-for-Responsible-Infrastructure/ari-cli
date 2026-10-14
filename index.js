@@ -237,4 +237,121 @@ pipelineProgram
         pipeline.logs({ ...options, name, runId }),
     );
 
+pipelineProgram
+    .command('fetch <name> <runId>')
+    .description(
+        "Download the run's result file (the manifest's resultKey) through the protected-data gate.",
+    )
+    .addOption(regionOption())
+    .option('--out <path>', 'output path (default ./<stage>-<runId>.<ext>)')
+    .option('--force', 'overwrite an existing output file', false)
+    .option(
+        '-y, --yes',
+        'skip the confirmation prompt (required when not on a terminal)',
+        false,
+    )
+    .option('--debug', 'prints debug statements.', false)
+    .action((name, runId, options) =>
+        pipeline.fetchResult({ ...options, name, runId }),
+    );
+
+/* Pipeline data plane: `ari pipeline data ...` */
+const dataProgram = pipelineProgram
+    .command('data')
+    .description(
+        "Work with a pipeline's S3 data via its manifest. ls/load/inspect never print content; get/cat go through the protected-data gate.",
+    );
+
+dataProgram
+    .command('stages <name>')
+    .description("Show the pipeline's stages (from its manifest; no S3 calls).")
+    .addOption(regionOption())
+    .option('--json', 'print JSON', false)
+    .option('--debug', 'prints debug statements.', false)
+    .action((name, options) => pipeline.dataStages({ ...options, name }));
+
+dataProgram
+    .command('ls <name> <runId>')
+    .description(
+        "List a run's objects (keys, sizes, dates only). Without --stage: per-stage counts.",
+    )
+    .addOption(regionOption())
+    .option('--stage <stage>', 'list this stage\'s keys')
+    .option('--match <text>', 'only ids containing this text (needs --stage)')
+    .option('--ids', 'bare ids, one per line (needs --stage)', false)
+    .option('--json', 'print JSON', false)
+    .option('--debug', 'prints debug statements.', false)
+    .action((name, runId, options) =>
+        pipeline.dataLs({ ...options, name, runId }),
+    );
+
+dataProgram
+    .command('load <name> <localDir>')
+    .description(
+        "Upload the top-level files of a local directory to the pipeline's input stage for a run.",
+    )
+    .addOption(regionOption())
+    .requiredOption('--run-id <id>', 'run id to load the data under')
+    .option('--stage <stage>', 'a loadable stage (default: the manifest inputStage)')
+    .option(
+        '-y, --yes',
+        'continue when the prefix already has objects (required when not on a terminal)',
+        false,
+    )
+    .option('--debug', 'prints debug statements (also lists uploaded file names).', false)
+    .action((name, localDir, options) =>
+        pipeline.dataLoad({ ...options, name, localDir }),
+    );
+
+dataProgram
+    .command('get <name> <runId> [id]')
+    .description(
+        'Download one object through the protected-data gate (readable stages only; no id = the result key).',
+    )
+    .addOption(regionOption())
+    .option('--stage <stage>', 'stage of <id> (required with an id)')
+    .option('--out <path>', 'output path')
+    .option('--force', 'overwrite an existing output file', false)
+    .option(
+        '-y, --yes',
+        'skip the confirmation prompt (required when not on a terminal)',
+        false,
+    )
+    .option('--debug', 'prints debug statements.', false)
+    .action((name, runId, id, options) =>
+        pipeline.dataGet({ ...options, name, runId, id }),
+    );
+
+dataProgram
+    .command('inspect <name> <runId> <id>')
+    .description(
+        'Show an object\'s structure only (CSV columns/row count, JSON key shape, sizes); never values.',
+    )
+    .addOption(regionOption())
+    .requiredOption('--stage <stage>', 'stage of <id>')
+    .option('--json', 'print JSON', false)
+    .option('--debug', 'prints debug statements.', false)
+    .action((name, runId, id, options) =>
+        pipeline.dataInspect({ ...options, name, runId, id }),
+    );
+
+dataProgram
+    .command('cat <name> <runId> <id>')
+    .description(
+        'Print an object to stdout through the protected-data gate (readable stages, text only, 64 KiB default, 1 MiB max).',
+    )
+    .addOption(regionOption())
+    .requiredOption('--stage <stage>', 'stage of <id>')
+    .option('--max-bytes <n>', 'bytes to read (default 65536, max 1048576)')
+    .option('--head <lines>', 'print only the first N lines')
+    .option(
+        '-y, --yes',
+        'skip the confirmation prompt (required when not on a terminal)',
+        false,
+    )
+    .option('--debug', 'prints debug statements.', false)
+    .action((name, runId, id, options) =>
+        pipeline.dataCat({ ...options, name, runId, id }),
+    );
+
 program.parse();

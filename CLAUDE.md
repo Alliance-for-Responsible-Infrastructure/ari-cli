@@ -45,8 +45,8 @@ behind.
 ### Entry Point
 
 `index.js` — registers the `credentials` command via Commander.js, with `--account`/`--role` choices
-read from `ari-config.json` at startup, plus a `pipeline` command with `deploy`/`run`/`wait`/`status`/`runs`/`stop`/`history`/`logs`
-subcommands (see "Pipeline commands" below). The binary is exposed as the `ari` command.
+read from `ari-config.json` at startup, plus a `pipeline` command with `deploy`/`run`/`wait`/`status`/`runs`/`stop`/`history`/`logs`/`fetch`
+and `data stages|ls|load|get|inspect|cat` subcommands (see "Pipeline commands" below). The binary is exposed as the `ari` command.
 
 ### Code Layout
 
@@ -58,6 +58,7 @@ src/
     credentials.js      # CredentialsCommand + printAccountsList()
     init.js              # InitCommand — interactive wizard + --from-file
     pipeline.js          # PipelineRun/Wait/Status/Runs/Stop/History/Logs/Deploy commands
+    pipeline-data.js     # PipelineData{Stages,Ls,Load,Get,Inspect,Cat}Command (get also serves `fetch`)
   commands/
     credentials.js      # thin handler: --list short-circuit, then CredentialsCommand.execute()
     init.js              # thin handler: InitCommand.run()
@@ -70,6 +71,9 @@ src/
       aws.js             # SSO device-flow login, role credential fetch/verify/write — pure AWS SDK
       pipeline.js        # named-pipeline SSM lookup, Step Functions + CloudWatch Logs calls — pure AWS SDK
       pipeline-utils.js  # pure helpers: exit codes, parseDuration, error classifiers, foldHistory, log line allow-list
+      manifest.js        # pure: schema-1 manifest validation, {stage}/{runId}/{id} keys
+      content-gate.js    # the content gate: readable allow-list, banner, caps, binary sniff, 0600 writes, path warnings
+      data-inspect.js    # structure-only CSV/JSON inspection (never returns values)
       prompt.js          # TTY detection + y/N confirm
 
 tests/
@@ -142,8 +146,8 @@ DynamoDB schema — same "stay generic" principle `credentials` follows for AWS 
 
 #### Operator commands (`wait`, `runs`, `stop`, `history`, `logs`)
 
-Spec: `ari-cli/references/pipeline-operator-tooling-spec.md` (Phase 1 and `logs --source lambda` (task 2.7) are implemented; Phase 3
-— `pipeline data …` and the rest of the manifest use — is not).
+Spec: `ari-cli/references/pipeline-operator-tooling-spec.md` (Phases 1 and 3 and `logs --source lambda` (task 2.7) are
+implemented; 3.9 — registering the `AriPipelineOperator` role in `ari-config.json` — waits for the permission set).
 
 - **Exit codes** (`EXIT` in `pipeline-utils.js`): 0 ok, 1 error, 2 usage/safety-gate refusal, 3 wait
   timeout, 4 credentials expired mid-wait, 10/11/12 execution FAILED/TIMED_OUT/ABORTED, 130 Ctrl-C.
@@ -170,6 +174,31 @@ Spec: `ari-cli/references/pipeline-operator-tooling-spec.md` (Phase 1 and `logs 
   `[line withheld …]`. Lambda platform lines carry no run id, so they are time-window based and the command prints an
   interleave notice (stderr) once. `--follow` works for all sources via `followExecutionLogs({ sources })`.
 
+#### Data plane (`pipeline data …`, `pipeline fetch`)
+
+Generic over any pipeline via its manifest (`/ari/pipelines/<name>/manifest`, schema 1; `validateDataManifest()` in
+`manifest.js` fails closed on anything unexpected). ari-cli knows the key shape `{stage}/{runId}/{id}` and the stage
+flags, nothing about what stages contain; no command reads the pipeline's DynamoDB table.
+
+- **Guard:** `resolveDataPipeline()` = `resolvePipeline(..., { manifest: true })`: SSM ARN, STS caller account must equal
+  the state machine ARN's account; then the manifest is read/validated (no manifest -> "redeploy" `PipelineError`,
+  unknown schema -> "update ari-cli"; its `stateMachineArn` must equal the registry's); then, if `accountKey` is set, the
+  caller must equal `~/.ari/config.json` `accounts[accountKey].accountId` (missing mapping fails closed: "run ari init").
+  Prints `[aws] account <id> (<accountKey>), region <r>`.
+- **Content gate** (`content-gate.js`, used by `get`/`cat`/`fetch`; NO bypass of any kind: no env var, config or flag
+  except per-call `--yes`): readable allow-list from the manifest (`raw` is not readable, so not even `get` can fetch it),
+  non-TTY without `--yes` -> exit 2 *before any AWS call*, banner (classification, account, bucket, key, size, version,
+  caller ARN; every classification gets one) then y/N, `cat` default 64 KiB / hard cap 1 MiB via ranged `GetObject`
+  pinned to the HEAD's version id, binary (NUL in first 4 KiB) refused before anything is printed or the file exists,
+  files `0600` (exclusive create; `--force` to replace; `fchmod`), warnings for git work trees / cloud-sync folders,
+  content only to stdout (`cat`) or `--out`. Never log content; CloudTrail is the only record (no local audit log).
+- **`inspect`** reads bytes but only `data-inspect.js` touches them and it returns column names, counts, JSON key names
+  with value *types*, sizes -- never a value, and never a parser error message (those quote input). Only `.csv`/`.json`
+  are read; other types use `HeadObject` metadata only; objects over 64 MiB are not read. Sentinel-string tests in
+  `tests/lib/data-inspect.test.js` and `tests/classes/pipeline-data.test.js` keep this true -- extend them if you touch it.
+- `ls` (no `--stage` = per-stage counts), `stages`, `load` (loadable stages only, counts not file names, asks before
+  adding to a non-empty prefix) never print content. IDs/keys printed are sanitized of control characters.
+
 ### Configuration Registry
 
 - `ari-config.json` (repo, public) — the three ARI account keys/friendly-names, allowed IAM roles,
@@ -194,7 +223,9 @@ Spec: `ari-cli/references/pipeline-operator-tooling-spec.md` (Phase 1 and `logs 
 `pipeline` commands, no `aws` CLI subprocess here either: `resolveStateMachineArn`, `resolvePipeline`
 (account guard), `generateRunId`, `startPipelineRun`, `executionArnFor`, `describePipelineRun`,
 `listPipelineRuns`, `stopPipelineRun`, `getExecutionHistory`, `waitForExecution`, `getStateMachineLogGroup`,
-`fetchExecutionLogs`, `followExecutionLogs`, `getPipelineManifest`, `fetchLambdaLogs`. Unit-tested in `tests/lib/pipeline.test.js` via injected `deps`;
+`fetchExecutionLogs`, `followExecutionLogs`, `getPipelineManifest`, `fetchLambdaLogs`, and the data plane
+(`resolveDataPipeline`, `listDataObjects`, `dataPrefixHasObjects`, `listLocalFiles`, `uploadDataFiles`, `headDataObject`,
+`readDataObject`, `downloadDataObject`; `@aws-sdk/client-s3`). Unit-tested in `tests/lib/pipeline.test.js` via injected `deps`;
 mocked wholesale in `tests/classes/pipeline.test.js` when testing the command classes.
 
 `terminal.js` (styled output via `picocolors`).

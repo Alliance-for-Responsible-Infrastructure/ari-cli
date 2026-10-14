@@ -1,7 +1,16 @@
 import crypto from 'crypto';
+import nodeFs from 'fs';
+import path from 'path';
 
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
+import {
+    S3Client,
+    ListObjectsV2Command,
+    PutObjectCommand,
+    HeadObjectCommand,
+    GetObjectCommand,
+} from '@aws-sdk/client-s3';
 import {
     SFNClient,
     StartExecutionCommand,
@@ -28,6 +37,13 @@ import {
     isTransient,
     lambdaLabels,
 } from '#src/lib/cli/pipeline-utils.js';
+import {
+    keyFor,
+    prefixFor,
+    validateDataManifest,
+} from '#src/lib/cli/manifest.js';
+import { writeProtectedFile } from '#src/lib/cli/content-gate.js';
+import { readLocalConfig } from '#src/lib/local-config.js';
 
 export const DEFAULT_PIPELINE_REGION = 'us-east-1';
 
@@ -45,6 +61,9 @@ export function defaultDeps(region = DEFAULT_PIPELINE_REGION) {
         createSts: () => new STSClient({ region }),
         createSfn: () => new SFNClient({ region }),
         createLogs: () => new CloudWatchLogsClient({ region }),
+        createS3: () => new S3Client({ region }),
+        readLocalConfig,
+        fs: nodeFs,
         sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
         now: () => Date.now(),
         random: Math.random,
@@ -76,18 +95,11 @@ function manifestParameterName(name) {
 }
 
 /**
- * Reads the pipeline's operator manifest (written by ari-iac's
- * PipelineRegistry) from `/ari/pipelines/<name>/manifest`. A pipeline
- * deployed before the registry existed has none: that is a clear error, not
- * a fallback to guessing names.
- *
- * @returns {Promise<Object>} the parsed manifest (schema 1)
+ * Reads and parses the manifest parameter (schema 1 enforced). A pipeline
+ * deployed before the registry existed has none: that is a clear error, not a
+ * fallback to guessing names.
  */
-export async function getPipelineManifest(
-    name,
-    region = DEFAULT_PIPELINE_REGION,
-    deps = {},
-) {
+async function readManifestParameter(name, region, deps, useHint) {
     const ssm = withDeps(region, deps).createSsm();
     let value;
     try {
@@ -99,9 +111,8 @@ export async function getPipelineManifest(
         if (e.name === 'ParameterNotFound') {
             throw new PipelineError(
                 `"${name}" has no manifest (no parameter at "${manifestParameterName(name)}"). ` +
-                    'The pipeline has not been redeployed with ari-iac\'s PipelineRegistry yet; ' +
-                    'redeploy it (ari pipeline deploy) to use "--source lambda"/"--source all". ' +
-                    '"--source sfn" works without it.',
+                    "The pipeline has not been redeployed with ari-iac's PipelineRegistry yet; " +
+                    `redeploy it (ari pipeline deploy) to use ${useHint}.`,
             );
         }
         throw e;
@@ -119,6 +130,26 @@ export async function getPipelineManifest(
             `The manifest for "${name}" has schema ${JSON.stringify(manifest?.schema)}, but this ari-cli only understands schema 1. Update ari-cli.`,
         );
     }
+    return manifest;
+}
+
+/**
+ * Reads the pipeline's operator manifest (written by ari-iac's
+ * PipelineRegistry) from `/ari/pipelines/<name>/manifest` for `logs`.
+ *
+ * @returns {Promise<Object>} the parsed manifest (schema 1)
+ */
+export async function getPipelineManifest(
+    name,
+    region = DEFAULT_PIPELINE_REGION,
+    deps = {},
+) {
+    const manifest = await readManifestParameter(
+        name,
+        region,
+        deps,
+        '"--source lambda"/"--source all" ("--source sfn" works without it)',
+    );
     const lambdaGroups = manifest.logGroups?.lambda;
     if (
         !Array.isArray(lambdaGroups) ||
@@ -264,18 +295,26 @@ export async function describePipelineRun(
 }
 
 /**
- * Resolves a pipeline name and applies the account guard: the caller's
- * account (STS GetCallerIdentity, which needs no IAM permission) must equal
- * the account embedded in the pipeline's state machine ARN. Prints
- * `[aws] account <id>, region <r>` to stderr once. (The manifest-based
- * `accountKey` check against ~/.ari/config.json is Phase 3 work.)
+ * Resolves a pipeline name and applies the account guard.
  *
- * @returns {Promise<{stateMachineArn: string, account: string, callerArn: string, region: string}>}
+ *  1. SSM `stateMachineArn` (the registry), STS `GetCallerIdentity` (needs no
+ *     IAM permission). The caller's account must equal the account embedded in
+ *     the state machine ARN.
+ *  2. With `{ manifest: true }` (the data-plane commands): also reads and
+ *     validates the manifest. A pipeline without one fails with a "redeploy"
+ *     message; an unknown schema fails with "update ari-cli". If the manifest
+ *     has an `accountKey`, the caller's account must ALSO equal that key's
+ *     account id in ~/.ari/config.json (fail closed when the mapping is
+ *     missing), and the manifest's state machine ARN must be the registry's.
+ *  3. Prints `[aws] account <id>[ (<accountKey>)], region <r>` to stderr once.
+ *
+ * @returns {Promise<{stateMachineArn: string, account: string, callerArn: string, region: string, manifest?: Object, accountKey?: string}>}
  */
 export async function resolvePipeline(
     name,
     region = DEFAULT_PIPELINE_REGION,
     deps = {},
+    { manifest: wantManifest = false } = {},
 ) {
     const d = withDeps(region, deps);
     const stateMachineArn = await resolveStateMachineArn(name, region, d);
@@ -291,9 +330,60 @@ export async function resolvePipeline(
         );
     }
 
-    d.logErr(`[aws] account ${Account}, region ${region}`);
-    return { stateMachineArn, account: Account, callerArn: Arn, region };
+    const result = {
+        stateMachineArn,
+        account: Account,
+        callerArn: Arn,
+        region,
+    };
+
+    if (wantManifest) {
+        const manifest = validateDataManifest(
+            await readManifestParameter(
+                name,
+                region,
+                d,
+                '"ari pipeline data …" / "ari pipeline fetch"',
+            ),
+            name,
+        );
+        if (
+            manifest.stateMachineArn !== undefined &&
+            manifest.stateMachineArn !== stateMachineArn
+        ) {
+            throw new PipelineError(
+                `The manifest for "${name}" names a different state machine than the registry does; refusing to continue. Redeploy the pipeline.`,
+            );
+        }
+        const { accountKey } = manifest;
+        if (accountKey) {
+            const expected = d.readLocalConfig()?.accounts?.[accountKey]
+                ?.accountId;
+            if (!expected) {
+                throw new PipelineError(
+                    `Pipeline "${name}" belongs to the "${accountKey}" account, but ~/.ari/config.json has no account id for it. Run: ari init`,
+                );
+            }
+            if (Account !== expected) {
+                throw new PipelineError(
+                    `You are signed in to AWS account ${Account}, but pipeline "${name}" belongs to the "${accountKey}" account (${expected}). ` +
+                        `Switch accounts with: ari credentials -a ${accountKey} -r <role>`,
+                );
+            }
+        }
+        result.manifest = manifest;
+        result.accountKey = accountKey;
+    }
+
+    d.logErr(
+        `[aws] account ${Account}${result.accountKey ? ` (${result.accountKey})` : ''}, region ${region}`,
+    );
+    return result;
 }
+
+/** `resolvePipeline` plus the validated manifest, for the data-plane commands. */
+export const resolveDataPipeline = (name, region, deps) =>
+    resolvePipeline(name, region, deps, { manifest: true });
 
 /**
  * Lists executions (newest first). Only ListExecutions metadata is
@@ -793,4 +883,265 @@ export async function followExecutionLogs(
         expired: EXIT.CREDENTIALS_EXPIRED,
     };
     return { outcome, exitCode: exitCodes[outcome], status };
+}
+
+/* ------------------------------------------------------------------ */
+/* Data plane (S3). Keys follow the manifest's `{stage}/{runId}/{id}`. */
+/* ------------------------------------------------------------------ */
+
+function s3Failure(e, what) {
+    const status = e?.$metadata?.httpStatusCode;
+    if (['NoSuchKey', 'NotFound'].includes(e?.name) || status === 404) {
+        return new PipelineError(`${what}: no such object.`);
+    }
+    if (
+        ['AccessDenied', 'Forbidden', 'AllAccessDisabled'].includes(e?.name) ||
+        status === 403
+    ) {
+        return new PipelineError(
+            `${what}: access denied by S3. Your role needs s3:ListBucket / s3:GetObject / s3:PutObject on the pipeline bucket ` +
+                '(ViewOnlyAccess does not have them; use AdministratorAccess for now).',
+        );
+    }
+    if (e?.name === 'NoSuchBucket') {
+        return new PipelineError(
+            `${what}: the bucket named in the manifest does not exist.`,
+        );
+    }
+    return e;
+}
+
+/**
+ * Lists a stage's objects for a run (keys, sizes, dates -- never content).
+ * @returns {Promise<Array<{id: string, key: string, size: number, lastModified: Date|undefined}>>}
+ */
+export async function listDataObjects(
+    manifest,
+    stage,
+    runId,
+    { match } = {},
+    region = DEFAULT_PIPELINE_REGION,
+    deps = {},
+) {
+    const s3 = withDeps(region, deps).createS3();
+    const prefix = prefixFor(manifest, stage, runId);
+    const needle = match ? match.toLowerCase() : null;
+    const objects = [];
+    let token;
+    try {
+        do {
+            const page = await s3.send(
+                new ListObjectsV2Command({
+                    Bucket: manifest.bucketName,
+                    Prefix: prefix,
+                    ContinuationToken: token,
+                }),
+            );
+            for (const o of page.Contents ?? []) {
+                const id = o.Key.slice(prefix.length);
+                if (id && (!needle || id.toLowerCase().includes(needle))) {
+                    objects.push({
+                        id,
+                        key: o.Key,
+                        size: o.Size,
+                        lastModified: o.LastModified,
+                    });
+                }
+            }
+            token = page.NextContinuationToken;
+        } while (token);
+    } catch (e) {
+        throw s3Failure(e, `Listing ${prefix}`);
+    }
+    return objects;
+}
+
+/** Whether anything already exists under the stage/run prefix (for `load`). */
+export async function dataPrefixHasObjects(
+    manifest,
+    stage,
+    runId,
+    region = DEFAULT_PIPELINE_REGION,
+    deps = {},
+) {
+    const s3 = withDeps(region, deps).createS3();
+    const prefix = prefixFor(manifest, stage, runId);
+    try {
+        const page = await s3.send(
+            new ListObjectsV2Command({
+                Bucket: manifest.bucketName,
+                Prefix: prefix,
+                MaxKeys: 1,
+            }),
+        );
+        return (page.Contents ?? []).length > 0;
+    } catch (e) {
+        throw s3Failure(e, `Listing ${prefix}`);
+    }
+}
+
+/** Top-level regular files of a local directory (not recursive), sorted. */
+export function listLocalFiles(localDir, deps = {}) {
+    const fs = deps.fs ?? nodeFs;
+    let entries;
+    try {
+        entries = fs.readdirSync(localDir, { withFileTypes: true });
+    } catch (e) {
+        throw new PipelineError(
+            `Cannot read directory ${localDir} (${e.code ?? e.name}).`,
+            EXIT.USAGE,
+        );
+    }
+    const names = entries
+        .filter((entry) => entry.isFile())
+        .map((entry) => entry.name)
+        .sort();
+    if (names.length === 0) {
+        throw new PipelineError(`No files found in ${localDir}`, EXIT.USAGE);
+    }
+    return names;
+}
+
+/**
+ * Uploads `fileNames` (top-level files of `localDir`) to `<stage>/<runId>/`.
+ * `onFile(name)` is called after each upload (the caller decides whether to
+ * print names). Returns counts only.
+ */
+export async function uploadDataFiles(
+    manifest,
+    { stage, runId, localDir, fileNames, onFile = () => {} },
+    region = DEFAULT_PIPELINE_REGION,
+    deps = {},
+) {
+    const d = withDeps(region, deps);
+    const s3 = d.createS3();
+    let bytes = 0;
+    for (const fileName of fileNames) {
+        const body = d.fs.readFileSync(path.join(localDir, fileName));
+        try {
+            await s3.send(
+                new PutObjectCommand({
+                    Bucket: manifest.bucketName,
+                    Key: keyFor(manifest, stage, runId, fileName),
+                    Body: body,
+                }),
+            );
+        } catch (e) {
+            throw s3Failure(e, 'Upload');
+        }
+        bytes += body.length;
+        onFile(fileName);
+    }
+    return { count: fileNames.length, bytes };
+}
+
+/**
+ * HeadObject: size, version id, content type, last modified. No content.
+ * (Needs s3:GetObject; recorded in CloudTrail like a read.)
+ */
+export async function headDataObject(
+    manifest,
+    stage,
+    runId,
+    id,
+    region = DEFAULT_PIPELINE_REGION,
+    deps = {},
+) {
+    const s3 = withDeps(region, deps).createS3();
+    const key = keyFor(manifest, stage, runId, id);
+    try {
+        const r = await s3.send(
+            new HeadObjectCommand({ Bucket: manifest.bucketName, Key: key }),
+        );
+        return {
+            key,
+            size: r.ContentLength ?? 0,
+            versionId: r.VersionId,
+            contentType: r.ContentType,
+            lastModified: r.LastModified,
+        };
+    } catch (e) {
+        throw s3Failure(e, `Object ${key}`);
+    }
+}
+
+async function collectBody(body, limit) {
+    const chunks = [];
+    let total = 0;
+    for await (const chunk of body) {
+        const buf = Buffer.from(chunk);
+        total += buf.length;
+        if (total > limit) {
+            body.destroy?.();
+            throw new PipelineError(
+                `Object is larger than the ${limit}-byte read limit; refusing to buffer it.`,
+                EXIT.USAGE,
+            );
+        }
+        chunks.push(buf);
+    }
+    return Buffer.concat(chunks);
+}
+
+/**
+ * GetObject into memory, bounded: `maxBytes` > 0 sends `Range: bytes=0-(n-1)`
+ * so the rest of the object is not even transferred. `versionId` pins the
+ * version the banner showed.
+ * @returns {Promise<Buffer>}
+ */
+export async function readDataObject(
+    manifest,
+    stage,
+    runId,
+    id,
+    { versionId, maxBytes } = {},
+    region = DEFAULT_PIPELINE_REGION,
+    deps = {},
+) {
+    const s3 = withDeps(region, deps).createS3();
+    const key = keyFor(manifest, stage, runId, id);
+    try {
+        const r = await s3.send(
+            new GetObjectCommand({
+                Bucket: manifest.bucketName,
+                Key: key,
+                VersionId: versionId,
+                Range: maxBytes ? `bytes=0-${maxBytes - 1}` : undefined,
+            }),
+        );
+        return await collectBody(r.Body, maxBytes ?? Infinity);
+    } catch (e) {
+        throw s3Failure(e, `Object ${key}`);
+    }
+}
+
+/**
+ * Streams an object to `outPath` (0600, no overwrite without `force`, binary
+ * refused before the file exists). Returns the byte count.
+ */
+export async function downloadDataObject(
+    manifest,
+    stage,
+    runId,
+    id,
+    outPath,
+    { versionId, force = false } = {},
+    region = DEFAULT_PIPELINE_REGION,
+    deps = {},
+) {
+    const d = withDeps(region, deps);
+    const key = keyFor(manifest, stage, runId, id);
+    let r;
+    try {
+        r = await d.createS3().send(
+            new GetObjectCommand({
+                Bucket: manifest.bucketName,
+                Key: key,
+                VersionId: versionId,
+            }),
+        );
+    } catch (e) {
+        throw s3Failure(e, `Object ${key}`);
+    }
+    return writeProtectedFile(outPath, r.Body, { force, fs: d.fs });
 }

@@ -9,6 +9,14 @@ import {
     PipelineHistoryCommand,
     PipelineLogsCommand,
 } from '#src/classes/pipeline.js';
+import {
+    PipelineDataStagesCommand,
+    PipelineDataLsCommand,
+    PipelineDataLoadCommand,
+    PipelineDataGetCommand,
+    PipelineDataInspectCommand,
+    PipelineDataCatCommand,
+} from '#src/classes/pipeline-data.js';
 
 const { error } = styles;
 
@@ -83,3 +91,49 @@ export const history = (options) => runCommand(PipelineHistoryCommand, options);
  * @param {Object} options - name, runId, region, source, follow, since, limit, full, json
  */
 export const logs = (options) => runCommand(PipelineLogsCommand, options);
+
+/**
+ * `ari pipeline data stages <name>` -- the manifest's stages (no content).
+ * @param {Object} options - name, region, json
+ */
+export const dataStages = (options) =>
+    runCommand(PipelineDataStagesCommand, options);
+
+/**
+ * `ari pipeline data ls <name> <runId>` -- keys/sizes/dates (no content).
+ * @param {Object} options - name, runId, region, stage, match, ids, json
+ */
+export const dataLs = (options) => runCommand(PipelineDataLsCommand, options);
+
+/**
+ * `ari pipeline data load <name> <localDir> --run-id <id>` -- upload files.
+ * @param {Object} options - name, localDir, runId, region, stage, yes
+ */
+export const dataLoad = (options) =>
+    runCommand(PipelineDataLoadCommand, options);
+
+/**
+ * `ari pipeline data get <name> <runId> [id]` -- gated download.
+ * @param {Object} options - name, runId, id, region, stage, out, force, yes
+ */
+export const dataGet = (options) => runCommand(PipelineDataGetCommand, options);
+
+/**
+ * `ari pipeline fetch <name> <runId>` -- gated download of the result key.
+ * @param {Object} options - name, runId, region, out, force, yes
+ */
+export const fetchResult = (options) =>
+    runCommand(PipelineDataGetCommand, { ...options, fetch: true });
+
+/**
+ * `ari pipeline data inspect <name> <runId> <id> --stage <s>` -- structure only.
+ * @param {Object} options - name, runId, id, region, stage, json
+ */
+export const dataInspect = (options) =>
+    runCommand(PipelineDataInspectCommand, options);
+
+/**
+ * `ari pipeline data cat <name> <runId> <id> --stage <s>` -- gated, bounded print.
+ * @param {Object} options - name, runId, id, region, stage, maxBytes, head, yes
+ */
+export const dataCat = (options) => runCommand(PipelineDataCatCommand, options);

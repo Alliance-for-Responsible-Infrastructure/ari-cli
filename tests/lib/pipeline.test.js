@@ -2,7 +2,7 @@
  * Tests for src/lib/cli/pipeline.js. No AWS: every function takes an
  * injected `deps` (fake client factories, fake clock/sleep, fake SIGINT).
  */
-import { jest, describe, expect, test, beforeEach } from '@jest/globals';
+import { jest, describe, expect, test, beforeEach, afterEach } from '@jest/globals';
 import {
     resolvePipeline,
     resolveStateMachineArn,
@@ -18,7 +18,20 @@ import {
     fetchLambdaLogs,
     lambdaLogSources,
     sfnLogSource,
+    resolveDataPipeline,
+    listDataObjects,
+    dataPrefixHasObjects,
+    listLocalFiles,
+    uploadDataFiles,
+    headDataObject,
+    readDataObject,
+    downloadDataObject,
 } from '#src/lib/cli/pipeline.js';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { Readable } from 'stream';
+import { MANIFEST as DATA_MANIFEST } from '../helpers/manifest-fixture.js';
 
 const SM_ARN =
     'arn:aws:states:us-east-1:123456789012:stateMachine:dev-demo-pipeline';
@@ -852,5 +865,211 @@ describe('Lambda logs', () => {
         expect(sfnCall.input.filterPattern).toBe(`{ $.execution_arn = "${EXEC_ARN}" }`);
         const lambdaCall = logs.calls.find((c) => c.input.logGroupName === GROUPS[0]);
         expect(lambdaCall.input.filterPattern).toBeUndefined();
+    });
+});
+
+describe('resolveDataPipeline (manifest + accountKey guard)', () => {
+    const SM = DATA_MANIFEST.stateMachineArn; // account 123456789012
+    const ssmWith = (manifest) => ({
+        send: jest.fn(async (command) => {
+            const name = command.input.Name;
+            if (name.endsWith('/stateMachineArn')) return { Parameter: { Value: SM } };
+            if (manifest instanceof Error) throw manifest;
+            return { Parameter: { Value: JSON.stringify(manifest) } };
+        }),
+        calls: [],
+    });
+    const sts = (Account) =>
+        fakeClient({ GetCallerIdentityCommand: [{ Account, Arn: 'arn:aws:sts::' + Account + ':assumed-role/Admin/jo' }] });
+    const localConfig = (accounts) => () => ({ accounts });
+    const deps = (over = {}) =>
+        makeDeps({
+            createSsm: () => ssmWith(DATA_MANIFEST),
+            createSts: () => sts('123456789012'),
+            readLocalConfig: localConfig({ controlled: { accountId: '123456789012' } }),
+            ...over,
+        });
+
+    test('returns the validated manifest and prints [aws] account <id> (<accountKey>)', async () => {
+        const d = deps();
+        const r = await resolveDataPipeline('dev-demo', 'us-east-1', d);
+        expect(r.manifest).toEqual(DATA_MANIFEST);
+        expect(r.accountKey).toBe('controlled');
+        expect(d.logErr).toHaveBeenCalledWith('[aws] account 123456789012 (controlled), region us-east-1');
+    });
+
+    test('caller account != state machine ARN account -> refused (even before the manifest is read)', async () => {
+        const d = deps({ createSts: () => sts('999999999999') });
+        await expect(resolveDataPipeline('dev-demo', 'us-east-1', d)).rejects.toThrow(/999999999999.*lives in account 123456789012/s);
+        expect(d.logErr).not.toHaveBeenCalled();
+    });
+
+    test('manifest accountKey != ~/.ari/config.json mapping -> refused with ari credentials -a <accountKey>', async () => {
+        const d = deps({ readLocalConfig: localConfig({ controlled: { accountId: '555555555555' } }) });
+        await expect(resolveDataPipeline('dev-demo', 'us-east-1', d)).rejects.toThrow(
+            /belongs to the "controlled" account \(555555555555\).*ari credentials -a controlled/s,
+        );
+        expect(d.logErr).not.toHaveBeenCalled();
+    });
+
+    test('accountKey with no local mapping fails closed (run ari init), also with no local config at all', async () => {
+        await expect(
+            resolveDataPipeline('dev-demo', 'us-east-1', deps({ readLocalConfig: localConfig({}) })),
+        ).rejects.toThrow(/no account id for it.*ari init/s);
+        await expect(
+            resolveDataPipeline('dev-demo', 'us-east-1', deps({ readLocalConfig: () => null })),
+        ).rejects.toThrow(/ari init/);
+    });
+
+    test('a manifest without accountKey is guarded by the state machine ARN account only', async () => {
+        const { accountKey: _k, ...noKey } = DATA_MANIFEST;
+        const d = deps({ createSsm: () => ssmWith(noKey), readLocalConfig: () => null });
+        const r = await resolveDataPipeline('dev-demo', 'us-east-1', d);
+        expect(r.accountKey).toBeUndefined();
+        expect(d.logErr).toHaveBeenCalledWith('[aws] account 123456789012, region us-east-1');
+    });
+
+    test('no manifest -> legacy message pointing at redeploy; control-plane resolvePipeline is unaffected', async () => {
+        const d = deps({ createSsm: () => ssmWith(err('ParameterNotFound')) });
+        await expect(resolveDataPipeline('dev-demo', 'us-east-1', d)).rejects.toThrow(
+            /"dev-demo" has no manifest.*redeploy.*ari pipeline data/s,
+        );
+        const plain = await resolvePipeline('dev-demo', 'us-east-1', deps({ createSsm: () => ssmWith(err('ParameterNotFound')) }));
+        expect(plain.manifest).toBeUndefined();
+    });
+
+    test('unknown schema and invalid manifests are clear errors', async () => {
+        await expect(
+            resolveDataPipeline('dev-demo', 'us-east-1', deps({ createSsm: () => ssmWith({ ...DATA_MANIFEST, schema: 2 }) })),
+        ).rejects.toThrow(/schema 2.*Update ari-cli/s);
+        await expect(
+            resolveDataPipeline('dev-demo', 'us-east-1', deps({ createSsm: () => ssmWith({ ...DATA_MANIFEST, stages: [] }) })),
+        ).rejects.toThrow(/invalid/);
+    });
+
+    test('a manifest naming a different state machine than the registry is refused', async () => {
+        const other = { ...DATA_MANIFEST, stateMachineArn: SM.replace('dev-demo-pipeline', 'other-pipeline') };
+        await expect(
+            resolveDataPipeline('dev-demo', 'us-east-1', deps({ createSsm: () => ssmWith(other) })),
+        ).rejects.toThrow(/different state machine/);
+    });
+});
+
+describe('data plane S3 calls', () => {
+    const body = (text) => Readable.from([Buffer.from(text)]);
+    const M = DATA_MANIFEST;
+
+    test('listDataObjects: prefix from the manifest, pagination, --match, bare ids', async () => {
+        const s3 = fakeClient({
+            ListObjectsV2Command: [
+                { Contents: [{ Key: 'chunks/r1/A.pdf/p1.txt', Size: 10 }, { Key: 'chunks/r1/', Size: 0 }], NextContinuationToken: 't' },
+                { Contents: [{ Key: 'chunks/r1/b.pdf/p1.txt', Size: 20 }] },
+            ],
+        });
+        const objs = await listDataObjects(M, 'chunks', 'r1', { match: 'a.pdf' }, 'us-east-1', { createS3: () => s3 });
+        expect(objs.map((o) => o.id)).toEqual(['A.pdf/p1.txt']);
+        expect(s3.calls[0].input).toMatchObject({ Bucket: 'dev-demo-pipeline', Prefix: 'chunks/r1/' });
+        expect(s3.calls[1].input.ContinuationToken).toBe('t');
+    });
+
+    test('listDataObjects rejects stages that are not in the manifest, without calling S3', async () => {
+        const s3 = fakeClient({});
+        await expect(listDataObjects(M, '../etc', 'r1', {}, 'us-east-1', { createS3: () => s3 })).rejects.toThrow(/Unknown stage/);
+        expect(s3.calls).toHaveLength(0);
+    });
+
+    test('S3 AccessDenied becomes a friendly error naming the role fix', async () => {
+        const s3 = fakeClient({ ListObjectsV2Command: [err('AccessDenied')] });
+        await expect(listDataObjects(M, 'raw', 'r1', {}, 'us-east-1', { createS3: () => s3 })).rejects.toThrow(/access denied.*AdministratorAccess/s);
+    });
+
+    test('dataPrefixHasObjects uses MaxKeys 1', async () => {
+        const s3 = fakeClient({ ListObjectsV2Command: [{ Contents: [{ Key: 'raw/r1/x' }] }] });
+        expect(await dataPrefixHasObjects(M, 'raw', 'r1', 'us-east-1', { createS3: () => s3 })).toBe(true);
+        expect(s3.calls[0].input.MaxKeys).toBe(1);
+    });
+
+    describe('local files + upload', () => {
+        let dir;
+        beforeEach(() => {
+            dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ari-load-'));
+        });
+        afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+        test('top-level files only (not recursive), sorted; empty dir is an error', () => {
+            fs.writeFileSync(path.join(dir, 'b.pdf'), 'B');
+            fs.writeFileSync(path.join(dir, 'a.pdf'), 'A');
+            fs.mkdirSync(path.join(dir, 'sub'));
+            fs.writeFileSync(path.join(dir, 'sub', 'c.pdf'), 'C');
+            expect(listLocalFiles(dir)).toEqual(['a.pdf', 'b.pdf']);
+            const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'ari-empty-'));
+            expect(() => listLocalFiles(empty)).toThrow(/No files found/);
+            fs.rmdirSync(empty);
+            expect(() => listLocalFiles(path.join(dir, 'missing'))).toThrow(/Cannot read directory/);
+        });
+
+        test('uploadDataFiles puts each file at <stage>/<runId>/<name> and returns counts', async () => {
+            fs.writeFileSync(path.join(dir, 'a.pdf'), 'AAAA');
+            fs.writeFileSync(path.join(dir, 'b.pdf'), 'BB');
+            const s3 = fakeClient({ PutObjectCommand: () => ({}) });
+            const seen = [];
+            const r = await uploadDataFiles(
+                M,
+                { stage: 'raw', runId: 'r1', localDir: dir, fileNames: ['a.pdf', 'b.pdf'], onFile: (n) => seen.push(n) },
+                'us-east-1',
+                { createS3: () => s3 },
+            );
+            expect(r).toEqual({ count: 2, bytes: 6 });
+            expect(seen).toEqual(['a.pdf', 'b.pdf']);
+            expect(s3.calls.map((c) => c.input.Key)).toEqual(['raw/r1/a.pdf', 'raw/r1/b.pdf']);
+            expect(s3.calls[0].input.Bucket).toBe('dev-demo-pipeline');
+        });
+    });
+
+    test('headDataObject returns metadata only; missing objects are a clean error', async () => {
+        const s3 = fakeClient({
+            HeadObjectCommand: [{ ContentLength: 12, VersionId: 'v9', ContentType: 'text/csv', LastModified: new Date(0) }],
+        });
+        expect(await headDataObject(M, 'final', 'r1', 'final.csv', 'us-east-1', { createS3: () => s3 })).toMatchObject({
+            key: 'final/r1/final.csv', size: 12, versionId: 'v9',
+        });
+        const missing = fakeClient({ HeadObjectCommand: [err('NotFound')] });
+        await expect(headDataObject(M, 'final', 'r1', 'x', 'us-east-1', { createS3: () => missing })).rejects.toThrow(/no such object/);
+    });
+
+    test('readDataObject: ranged request caps the transfer and pins the version', async () => {
+        const s3 = fakeClient({ GetObjectCommand: [{ Body: body('hello') }] });
+        const buf = await readDataObject(M, 'chunks', 'r1', 'a.txt', { versionId: 'v1', maxBytes: 100 }, 'us-east-1', { createS3: () => s3 });
+        expect(buf.toString()).toBe('hello');
+        expect(s3.calls[0].input).toMatchObject({ Key: 'chunks/r1/a.txt', Range: 'bytes=0-99', VersionId: 'v1' });
+    });
+
+    test('readDataObject refuses a body larger than the limit even if the server ignores Range', async () => {
+        const s3 = fakeClient({ GetObjectCommand: [{ Body: body('x'.repeat(50)) }] });
+        await expect(
+            readDataObject(M, 'chunks', 'r1', 'a.txt', { maxBytes: 10 }, 'us-east-1', { createS3: () => s3 }),
+        ).rejects.toThrow(/larger than the 10-byte/);
+    });
+
+    test('readDataObject without maxBytes sends no Range (inspect reads whole objects)', async () => {
+        const s3 = fakeClient({ GetObjectCommand: [{ Body: body('x') }] });
+        await readDataObject(M, 'final', 'r1', 'final.csv', {}, 'us-east-1', { createS3: () => s3 });
+        expect(s3.calls[0].input.Range).toBeUndefined();
+    });
+
+    test('downloadDataObject writes a 0600 file and refuses to overwrite without force', async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ari-dl-'));
+        try {
+            const out = path.join(dir, 'f.csv');
+            const mk = () => fakeClient({ GetObjectCommand: () => ({ Body: body('a,b\n1,2\n') }) });
+            const r = await downloadDataObject(M, 'final', 'r1', 'final.csv', out, { versionId: 'v1' }, 'us-east-1', { createS3: mk });
+            expect(r.bytes).toBe(8);
+            expect(fs.statSync(out).mode & 0o777).toBe(0o600);
+            await expect(
+                downloadDataObject(M, 'final', 'r1', 'final.csv', out, {}, 'us-east-1', { createS3: mk }),
+            ).rejects.toThrow(/already exists/);
+        } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
     });
 });
