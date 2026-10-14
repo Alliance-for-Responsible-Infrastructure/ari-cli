@@ -3,19 +3,29 @@ import {
     PipelineRunCommand,
     PipelineStatusCommand,
     PipelineDeployCommand,
+    PipelineWaitCommand,
+    PipelineRunsCommand,
+    PipelineStopCommand,
+    PipelineHistoryCommand,
+    PipelineLogsCommand,
 } from '#src/classes/pipeline.js';
 
 const { error } = styles;
 
-async function runCommand(CommandClass, options) {
+/**
+ * Runs a command class and exits with its exit code: `e.exitCode ?? 1` for
+ * errors (PipelineError carries one), `cmd.exitCode ?? 0` on success (e.g.
+ * `wait` exits 10 for a FAILED execution without throwing).
+ */
+export async function runCommand(CommandClass, options) {
     const cmd = new CommandClass(options);
     try {
         await cmd.execute();
     } catch (e) {
         console.error(error('Error:'), e.message);
-        process.exit(1);
+        process.exit(e.exitCode ?? 1);
     }
-    process.exit(0);
+    process.exit(cmd.exitCode ?? 0);
 }
 
 /**
@@ -43,3 +53,33 @@ export const run = (options) => runCommand(PipelineRunCommand, options);
  * @param {string} options.region
  */
 export const status = (options) => runCommand(PipelineStatusCommand, options);
+
+/**
+ * `ari pipeline wait <name> <runId>` — waits for an existing run to finish.
+ * @param {Object} options - name, runId, region, interval, timeout, json
+ */
+export const wait = (options) => runCommand(PipelineWaitCommand, options);
+
+/**
+ * `ari pipeline runs <name>` — lists runs (executions).
+ * @param {Object} options - name, region, status, limit, all, json
+ */
+export const runs = (options) => runCommand(PipelineRunsCommand, options);
+
+/**
+ * `ari pipeline stop <name> <runId>` — stops a RUNNING run (confirmed).
+ * @param {Object} options - name, runId, region, cause, yes
+ */
+export const stop = (options) => runCommand(PipelineStopCommand, options);
+
+/**
+ * `ari pipeline history <name> <runId>` — per-state summary of a run.
+ * @param {Object} options - name, runId, region, failedOnly, showCause, json
+ */
+export const history = (options) => runCommand(PipelineHistoryCommand, options);
+
+/**
+ * `ari pipeline logs <name> <runId>` — Step Functions log events for a run.
+ * @param {Object} options - name, runId, region, source, follow, since, limit, full, json
+ */
+export const logs = (options) => runCommand(PipelineLogsCommand, options);

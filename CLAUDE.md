@@ -45,7 +45,7 @@ behind.
 ### Entry Point
 
 `index.js` — registers the `credentials` command via Commander.js, with `--account`/`--role` choices
-read from `ari-config.json` at startup, plus a `pipeline` command with `deploy`/`run`/`status`
+read from `ari-config.json` at startup, plus a `pipeline` command with `deploy`/`run`/`wait`/`status`/`runs`/`stop`/`history`/`logs`
 subcommands (see "Pipeline commands" below). The binary is exposed as the `ari` command.
 
 ### Code Layout
@@ -57,7 +57,7 @@ src/
     base-command.js    # queue-based execute(), AWS env cleanup, version check
     credentials.js      # CredentialsCommand + printAccountsList()
     init.js              # InitCommand — interactive wizard + --from-file
-    pipeline.js          # PipelineRunCommand / PipelineStatusCommand / PipelineDeployCommand
+    pipeline.js          # PipelineRun/Wait/Status/Runs/Stop/History/Logs/Deploy commands
   commands/
     credentials.js      # thin handler: --list short-circuit, then CredentialsCommand.execute()
     init.js              # thin handler: InitCommand.run()
@@ -68,10 +68,14 @@ src/
     cli/
       terminal.js        # picocolors-based styles (success/error/warn/emphasis/bold)
       aws.js             # SSO device-flow login, role credential fetch/verify/write — pure AWS SDK
-      pipeline.js        # named-pipeline SSM lookup, StartExecution/DescribeExecution — pure AWS SDK
+      pipeline.js        # named-pipeline SSM lookup, Step Functions + CloudWatch Logs calls — pure AWS SDK
+      pipeline-utils.js  # pure helpers: exit codes, parseDuration, error classifiers, foldHistory, log line allow-list
+      prompt.js          # TTY detection + y/N confirm
 
 tests/
   classes/     # Jest tests mirroring src/classes
+  commands/    # runCommand exit-code mapping
+  lib/         # lib layer tests (injected `deps`, no AWS SDK mocking) + pure helper tests
   helpers/     # Shared test utilities
 ```
 
@@ -136,6 +140,36 @@ DynamoDB schema — same "stay generic" principle `credentials` follows for AWS 
   `src/classes/pipeline.js` and `ari-cli/references/pipeline-cli-workflow-steps.md` (work breakdown
   item 3) for the design discussion.
 
+#### Operator commands (`wait`, `runs`, `stop`, `history`, `logs`)
+
+Spec: `ari-cli/references/pipeline-operator-tooling-spec.md` (Phase 1 and `logs --source lambda` (task 2.7) are implemented; Phase 3
+— `pipeline data …` and the rest of the manifest use — is not).
+
+- **Exit codes** (`EXIT` in `pipeline-utils.js`): 0 ok, 1 error, 2 usage/safety-gate refusal, 3 wait
+  timeout, 4 credentials expired mid-wait, 10/11/12 execution FAILED/TIMED_OUT/ABORTED, 130 Ctrl-C.
+  `runCommand()` exits with `e.exitCode ?? 1` on errors (throw `PipelineError`) and `cmd.exitCode ?? 0` on success.
+- **Account guard:** every command resolves through `resolvePipeline()` — SSM lookup, then STS
+  `GetCallerIdentity`; caller account must equal the account in the state machine ARN; prints
+  `[aws] account …` to stderr.
+- **Wait:** `waitForExecution()` and `followExecutionLogs()` share `pollLoop()`: transient errors back off
+  (x2, cap 60s, 5 consecutive -> error), expired credentials rebuild the client (re-reads
+  `~/.aws/credentials`) and retry once, first SIGINT stops waiting only (never `StopExecution`), second exits.
+  All lib functions take an injectable `deps` (client factories, `sleep`, `now`, `onSigint`, ...) — tests use
+  that instead of mocking the SDK.
+- **Protected data:** `foldHistory()` and `formatSfnLogEvent()` are allow-lists (names, types, timings, counts,
+  error codes); `input`/`output`/Map items are never read and `cause` only with `history --show-cause`.
+  History is fetched with `includeExecutionData: false`. `status` prints the execution output only with
+  `--show-output`. `stop` needs a TTY confirm or `--yes` (exit 2 otherwise). Keep tests with sentinel strings
+  proving no payload leaks when touching these.
+- `logs --source sfn` takes its log group from `DescribeStateMachine`. `--source lambda|all` reads the SSM manifest
+  `/ari/pipelines/<name>/manifest` (`getPipelineManifest()`: schema must be 1, needs `logGroups.lambda`; absent
+  parameter -> clear "redeploy" `PipelineError`, no guessing) and fetches those groups for `[startDate, stopDate+10s]`
+  with NO server-side pattern: every event goes through `classifyLambdaLogEvent()`, an allow-list that renders only
+  START/END/REPORT numbers, the EMF metric line (`METRIC step=… duration=…`, only if its `runId` matches; `fileId` is
+  never printed), `Invoke Error` -> error code only, timeout/runtime-exit figures, and replaces everything else with
+  `[line withheld …]`. Lambda platform lines carry no run id, so they are time-window based and the command prints an
+  interleave notice (stderr) once. `--follow` works for all sources via `followExecutionLogs({ sources })`.
+
 ### Configuration Registry
 
 - `ari-config.json` (repo, public) — the three ARI account keys/friendly-names, allowed IAM roles,
@@ -156,11 +190,12 @@ DynamoDB schema — same "stay generic" principle `credentials` follows for AWS 
 - `writeDefaultCredentials`: a small hand-rolled INI reader/writer for `~/.aws/credentials` (no
   `aws configure set` subprocess).
 
-`pipeline.js` — the named-pipeline registry lookup and Step Functions calls behind the `pipeline`
-commands, no `aws` CLI subprocess here either: `resolveStateMachineArn` (`ssm:GetParameter`),
-`generateRunId`, `startPipelineRun` (`sfn:StartExecution`), `executionArnFor`,
-`describePipelineRun` (`sfn:DescribeExecution`). Not unit-tested directly (same convention as
-`aws.js`) — mocked wholesale in `tests/classes/pipeline.test.js` when testing the command classes.
+`pipeline.js` — the named-pipeline registry lookup, Step Functions and CloudWatch Logs calls behind the
+`pipeline` commands, no `aws` CLI subprocess here either: `resolveStateMachineArn`, `resolvePipeline`
+(account guard), `generateRunId`, `startPipelineRun`, `executionArnFor`, `describePipelineRun`,
+`listPipelineRuns`, `stopPipelineRun`, `getExecutionHistory`, `waitForExecution`, `getStateMachineLogGroup`,
+`fetchExecutionLogs`, `followExecutionLogs`, `getPipelineManifest`, `fetchLambdaLogs`. Unit-tested in `tests/lib/pipeline.test.js` via injected `deps`;
+mocked wholesale in `tests/classes/pipeline.test.js` when testing the command classes.
 
 `terminal.js` (styled output via `picocolors`).
 
