@@ -87,13 +87,50 @@ const pipelineProgram = program
     .command('pipeline')
     .description('Deploy, run, monitor, and stop named ari-iac pipelines.');
 
+const APPROVAL_MODES = ['never', 'any-change', 'broadening'];
+const cwdNote =
+    "(run from inside that pipeline's own repo directory; account and region come from its config/default.json and ~/.ari/config.json, so there is no --region or --profile)";
+
 pipelineProgram
     .command('deploy <name>')
     .description(
-        "Deploy a named pipeline's stack (run from inside that pipeline's own repo directory).",
+        `Deploy a named pipeline's stack, behind an account guard ${cwdNote}.`,
+    )
+    .addOption(
+        new Option(
+            '--require-approval <mode>',
+            "pass through to cdk (default: cdk's own, broadening)",
+        ).choices(APPROVAL_MODES),
+    )
+    .option(
+        '--bootstrap',
+        'run "cdk bootstrap" for the account/region first (after confirmation)',
+        false,
+    )
+    .option(
+        '--yes',
+        'skip confirmations (required off a TTY for --bootstrap and --require-approval never)',
+        false,
     )
     .option('--debug', 'prints debug statements.', false)
     .action((name, options) => pipeline.deploy({ ...options, name }));
+
+pipelineProgram
+    .command('diff <name>')
+    .description(
+        `Show "cdk diff" for a named pipeline, behind the account guard ${cwdNote}.`,
+    )
+    .option('--debug', 'prints debug statements.', false)
+    .action((name, options) => pipeline.diff({ ...options, name }));
+
+pipelineProgram
+    .command('synth <name>')
+    .description(
+        `Run "cdk synth" for a named pipeline, behind the account guard ${cwdNote}.`,
+    )
+    .option('--quiet', 'do not print the template to stdout', false)
+    .option('--debug', 'prints debug statements.', false)
+    .action((name, options) => pipeline.synth({ ...options, name }));
 
 const regionOption = () =>
     new Option(

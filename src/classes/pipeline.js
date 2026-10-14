@@ -31,6 +31,11 @@ import {
     foldHistory,
 } from '#src/lib/cli/pipeline-utils.js';
 import { confirm, isInteractive } from '#src/lib/cli/prompt.js';
+import {
+    DEFAULT_BOOTSTRAP_QUALIFIER,
+    getBootstrapVersion,
+    getCallerAccount,
+} from '#src/lib/cli/aws.js';
 import BaseAriCommand from './base-command.js';
 
 const { success, error, warn, emphasis, bold } = styles;
@@ -764,72 +769,250 @@ export class PipelineLogsCommand extends BaseAriCommand {
     }
 }
 
+const QUALIFIER_RE = /^[A-Za-z0-9]{1,10}$/;
+const APPROVAL_MODES = ['never', 'any-change', 'broadening'];
+
 /**
- * `ari pipeline deploy <name>` — a thin, cwd-based wrapper around `cdk
- * deploy`, not a name -> repo-path registry (that registry problem doesn't
- * need solving yet — see ari-cli/references/pipeline-cli-workflow-steps.md).
- * Must be run from inside the named pipeline's own repo directory, the same
- * place a human would run `npx cdk deploy` by hand. Reads that repo's own
- * `./config/default.json` directly off disk (plain fs.readFileSync, *not*
- * the `config` npm package — that package resolves relative to ari-cli's
- * own install location, not the caller's cwd) to compute
- * `projectName = "{environment}-{workloadName}"` and compares it against
- * the given <name> as a cheap "wrong directory" safety check. Does no AWS
- * SDK work of its own — `npx cdk deploy` runs with stdio inherited so CDK's
- * own interactive diff/approval prompts and output reach the user directly.
+ * Shared base for `ari pipeline deploy|diff|synth <name>`: thin, cwd-based
+ * wrappers around `npx cdk <verb>` (not a name -> repo-path registry). Must
+ * be run from inside the named pipeline's own repo directory. Reads that
+ * repo's own `./config/default.json` directly off disk (plain fs, *not* the
+ * `config` npm package, which resolves relative to ari-cli's install) for
+ * `projectName = "{environment}-{workloadName}"`, `iac.account` and
+ * `iac.region`, then applies, before spawning cdk:
+ *
+ *  1. the wrong-directory check (<name> must equal projectName);
+ *  2. the account guard: STS GetCallerIdentity must equal the account id that
+ *     ~/.ari/config.json holds for `iac.account` (fail closed if unmapped);
+ *  3. the region check: AWS_REGION / AWS_DEFAULT_REGION, if set, must equal
+ *     `iac.region`;
+ *  4. (deploy/diff) the CDK bootstrap check via SSM.
+ *
+ * There is intentionally no --region/--profile flag: region comes from the
+ * repo's config and identity from `ari credentials`/AWS_PROFILE, so the guard
+ * has a single source of truth. cdk gets a fixed allow-listed argv, never
+ * arbitrary passthrough, with stdio inherited so its own output reaches the
+ * user.
  */
-export class PipelineDeployCommand extends BaseAriCommand {
+class PipelineCdkCommand extends BaseAriCommand {
+    /** cdk subcommand (`deploy` | `diff` | `synth`). */
+    verb = '';
+    /** Whether the bootstrap check applies. */
+    checksBootstrap = true;
+
     constructor(options) {
         super(options);
         this.name = options.name;
         this.addActions();
     }
 
-    #readProjectName() {
+    #readConfig() {
         const configPath = path.join(this.cwd, 'config', 'default.json');
         let config;
         try {
             config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
         } catch (e) {
-            throw new Error(
-                `Could not read ${configPath} (${e.message}) — run "ari pipeline deploy ${this.name}" from inside ${this.name}'s own repo directory.`,
+            throw new PipelineError(
+                `Could not read ${configPath} (${e.message}) — run "ari pipeline ${this.verb} ${this.name}" from inside ${this.name}'s own repo directory.`,
+                EXIT.USAGE,
             );
         }
-
-        const { environment, workloadName } = config.iac ?? {};
-        return `${environment}-${workloadName}`;
+        const { environment, workloadName, account, region } = config.iac ?? {};
+        return {
+            projectName: `${environment}-${workloadName}`,
+            accountKey: account,
+            region,
+        };
     }
 
-    async executeDeploy() {
-        const projectName = this.#readProjectName();
-        if (projectName !== this.name) {
-            throw new Error(
-                `"${this.name}" doesn't match this directory's pipeline ("${projectName}", per ./config/default.json) — run this from inside ${this.name}'s own repo directory instead.`,
+    #readQualifier() {
+        let context;
+        try {
+            context = JSON.parse(
+                fs.readFileSync(path.join(this.cwd, 'cdk.json'), 'utf-8'),
+            ).context;
+        } catch {
+            return DEFAULT_BOOTSTRAP_QUALIFIER;
+        }
+        const q = context?.['@aws-cdk/core:bootstrapQualifier'];
+        if (q === undefined) return DEFAULT_BOOTSTRAP_QUALIFIER;
+        if (typeof q !== 'string' || !QUALIFIER_RE.test(q)) {
+            throw new PipelineError(
+                'cdk.json context "@aws-cdk/core:bootstrapQualifier" must be 1-10 letters/digits.',
+                EXIT.USAGE,
             );
         }
+        return q;
+    }
 
-        console.log(
-            success('Deploying:'),
-            `${emphasis(projectName)} via "npx cdk deploy" (output below is CDK's own)`,
-        );
+    /** Extra allow-listed cdk args for this verb. */
+    cdkArgs() {
+        return [];
+    }
 
-        const result = spawnSync('npx', ['cdk', 'deploy'], {
+    #spawnCdk(args) {
+        // Mirrors scripts/lib/identity.js: never hand a Bedrock bearer token
+        // to a subprocess. (Harmless for cdk; keeps the invariant uniform.)
+        const env = { ...process.env };
+        delete env.AWS_BEARER_TOKEN_BEDROCK;
+        const result = spawnSync('npx', ['cdk', ...args], {
             cwd: this.cwd,
             stdio: 'inherit',
+            env,
         });
-
         if (result.error) {
             throw result.error;
         }
         if (result.status !== 0) {
-            throw new Error(
-                `"npx cdk deploy" exited with code ${result.status}`,
+            throw new PipelineError(
+                `"npx cdk ${args[0]}" exited with code ${result.status}`,
             );
         }
     }
 
+    /** Hook for deploy: confirm before spawning. Default none. */
+    async beforeSpawn() {}
+
+    async executeCdk() {
+        const { projectName, accountKey, region } = this.#readConfig();
+        if (projectName !== this.name) {
+            throw new PipelineError(
+                `"${this.name}" doesn't match this directory's pipeline ("${projectName}", per ./config/default.json) — run this from inside ${this.name}'s own repo directory instead.`,
+                EXIT.USAGE,
+            );
+        }
+        if (!accountKey || !region) {
+            throw new PipelineError(
+                'config/default.json must set iac.account and iac.region; refusing to continue without an account to guard.',
+                EXIT.USAGE,
+            );
+        }
+
+        const expected = this.localConfig?.accounts?.[accountKey]?.accountId;
+        if (!expected) {
+            throw new PipelineError(
+                `This pipeline belongs to the "${accountKey}" account, but ~/.ari/config.json has no account id for it. Run: ari init`,
+                EXIT.USAGE,
+            );
+        }
+
+        for (const v of ['AWS_REGION', 'AWS_DEFAULT_REGION']) {
+            if (process.env[v] && process.env[v] !== region) {
+                throw new PipelineError(
+                    `${v} is "${process.env[v]}" but this pipeline deploys to ${region} (iac.region). Unset ${v} or fix config/default.json.`,
+                    EXIT.USAGE,
+                );
+            }
+        }
+
+        const account = await getCallerAccount(region);
+        if (account !== expected) {
+            throw new PipelineError(
+                `You are signed in to AWS account ${account}, but pipeline "${this.name}" belongs to the "${accountKey}" account (${expected}). ` +
+                    `Switch accounts with: ari credentials -a ${accountKey} -r <role>`,
+                EXIT.USAGE,
+            );
+        }
+        console.error(
+            `[aws] account ${account} (${accountKey}), region ${region}`,
+        );
+
+        const bootstrapCmd = `npx cdk bootstrap aws://${account}/${region}`;
+        let bootstrapFirst = false;
+        if (this.checksBootstrap) {
+            if (this.options.bootstrap) {
+                bootstrapFirst = true;
+            } else if (
+                !(await getBootstrapVersion(this.#readQualifier(), region))
+            ) {
+                throw new PipelineError(
+                    `This account/region is not CDK-bootstrapped. Run: ari pipeline deploy ${this.name} --bootstrap  (or: ${bootstrapCmd})`,
+                    EXIT.USAGE,
+                );
+            }
+        }
+
+        await this.beforeSpawn();
+
+        if (bootstrapFirst) {
+            if (!this.options.yes) {
+                if (!isInteractive()) {
+                    throw new PipelineError(
+                        'Refusing to bootstrap without confirmation on a non-interactive terminal. Re-run with --yes.',
+                        EXIT.USAGE,
+                    );
+                }
+                const ok = await confirm(
+                    `Run "${bootstrapCmd}" for ${this.name}?`,
+                );
+                if (!ok) {
+                    throw new PipelineError('Not bootstrapped.', EXIT.USAGE);
+                }
+            }
+            console.log(success('Bootstrapping:'), emphasis(bootstrapCmd));
+            this.#spawnCdk(['bootstrap', `aws://${account}/${region}`]);
+        }
+
+        console.log(
+            success(`${this.verb}:`),
+            `${emphasis(projectName)} via "npx cdk ${this.verb}" (output below is CDK's own)`,
+        );
+        this.#spawnCdk([this.verb, ...this.cdkArgs()]);
+    }
+
     addActions() {
         super.addActions();
-        this.addAction(this.executeDeploy);
+        this.addAction(this.executeCdk);
+    }
+}
+
+/**
+ * `ari pipeline deploy <name>` — guarded `npx cdk deploy`. `--require-approval
+ * never|any-change|broadening` passes through (default: CDK's own); `never`
+ * off a TTY needs `--yes`. `--bootstrap` runs `cdk bootstrap` first.
+ */
+export class PipelineDeployCommand extends PipelineCdkCommand {
+    verb = 'deploy';
+
+    cdkArgs() {
+        const mode = this.options.requireApproval;
+        return mode ? ['--require-approval', mode] : [];
+    }
+
+    async beforeSpawn() {
+        const mode = this.options.requireApproval;
+        if (mode !== undefined && !APPROVAL_MODES.includes(mode)) {
+            throw new PipelineError(
+                `--require-approval must be one of: ${APPROVAL_MODES.join(', ')}.`,
+                EXIT.USAGE,
+            );
+        }
+        if (mode === 'never') {
+            console.error(
+                warn('Warning:'),
+                'deploying with --require-approval never: security-sensitive changes (IAM, bucket policy) will NOT be confirmed.',
+            );
+            if (!this.options.yes && !isInteractive()) {
+                throw new PipelineError(
+                    'Refusing --require-approval never on a non-interactive terminal without --yes.',
+                    EXIT.USAGE,
+                );
+            }
+        }
+    }
+}
+
+/** `ari pipeline diff <name>` — guarded `npx cdk diff`. */
+export class PipelineDiffCommand extends PipelineCdkCommand {
+    verb = 'diff';
+}
+
+/** `ari pipeline synth <name> [--quiet]` — guarded `npx cdk synth`. */
+export class PipelineSynthCommand extends PipelineCdkCommand {
+    verb = 'synth';
+    checksBootstrap = false;
+
+    cdkArgs() {
+        return this.options.quiet ? ['--quiet'] : [];
     }
 }

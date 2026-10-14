@@ -23,6 +23,18 @@ jest.unstable_mockModule('child_process', () => ({
     spawnSync: jest.fn(() => ({ status: 0, error: null })),
 }));
 
+jest.unstable_mockModule('#src/lib/cli/aws.js', () => ({
+    DEFAULT_BOOTSTRAP_QUALIFIER: 'hnb659fds',
+    getCallerAccount: jest.fn().mockResolvedValue('123456789012'),
+    getBootstrapVersion: jest.fn().mockResolvedValue('21'),
+}));
+
+jest.unstable_mockModule('#src/lib/local-config.js', () => ({
+    readLocalConfig: jest.fn(() => ({
+        accounts: { controlled: { accountId: '123456789012' } },
+    })),
+}));
+
 const SM_ARN =
     'arn:aws:states:us-east-1:123456789012:stateMachine:dev-bedrock-docs-pipeline';
 const EXEC_ARN =
@@ -83,10 +95,15 @@ const {
 const { PipelineError } = await import('#src/lib/cli/pipeline-utils.js');
 const { confirm, isInteractive } = await import('#src/lib/cli/prompt.js');
 const { spawnSync } = await import('child_process');
+const { getCallerAccount, getBootstrapVersion } =
+    await import('#src/lib/cli/aws.js');
+const { readLocalConfig } = await import('#src/lib/local-config.js');
 const {
     PipelineRunCommand,
     PipelineStatusCommand,
     PipelineDeployCommand,
+    PipelineDiffCommand,
+    PipelineSynthCommand,
     PipelineWaitCommand,
     PipelineRunsCommand,
     PipelineStopCommand,
@@ -103,13 +120,24 @@ beforeEach(() => {
     errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 });
 
-function writeTempPipelineConfig({ environment, workloadName }) {
+function writeTempPipelineConfig({
+    environment,
+    workloadName,
+    account = 'controlled',
+    region = 'us-east-1',
+    cdkJson,
+}) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ari-pipeline-deploy-'));
     fs.mkdirSync(path.join(dir, 'config'));
     fs.writeFileSync(
         path.join(dir, 'config', 'default.json'),
-        JSON.stringify({ iac: { environment, workloadName } }),
+        JSON.stringify({
+            iac: { environment, workloadName, account, region },
+        }),
     );
+    if (cdkJson) {
+        fs.writeFileSync(path.join(dir, 'cdk.json'), JSON.stringify(cdkJson));
+    }
     return dir;
 }
 
@@ -205,9 +233,25 @@ describe('PipelineStatusCommand', () => {
     });
 });
 
-describe('PipelineDeployCommand', () => {
+describe.each([
+    ['deploy', PipelineDeployCommand],
+    ['diff', PipelineDiffCommand],
+    ['synth', PipelineSynthCommand],
+])('cdk wrapper guards: %s', (verb, Cmd) => {
     let originalCwd;
     let tempDir;
+    const enter = (opts = {}) => {
+        tempDir = writeTempPipelineConfig({
+            environment: 'dev',
+            workloadName: 'bedrock-docs',
+            ...opts,
+        });
+        originalCwd = process.cwd();
+        process.chdir(tempDir);
+        return process.cwd();
+    };
+    const run = (options = {}) =>
+        new Cmd({ name: 'dev-bedrock-docs', ...options }).execute();
 
     afterEach(() => {
         if (originalCwd) process.chdir(originalCwd);
@@ -216,67 +260,247 @@ describe('PipelineDeployCommand', () => {
         tempDir = undefined;
     });
 
-    test('reads ./config/default.json and shells "npx cdk deploy" with stdio inherited', async () => {
-        tempDir = writeTempPipelineConfig({
-            environment: 'dev',
-            workloadName: 'bedrock-docs',
-        });
-        originalCwd = process.cwd();
-        process.chdir(tempDir);
-        const resolvedCwd = process.cwd();
+    test('spawns "npx cdk <verb>" with stdio inherited and no bearer token', async () => {
+        const cwd = enter();
+        process.env.AWS_BEARER_TOKEN_BEDROCK = 'secret';
+        try {
+            await expect(run()).resolves.toBeUndefined();
+        } finally {
+            delete process.env.AWS_BEARER_TOKEN_BEDROCK;
+        }
 
-        const cmd = new PipelineDeployCommand({ name: 'dev-bedrock-docs' });
-        await expect(cmd.execute()).resolves.toBeUndefined();
-
-        expect(spawnSync).toHaveBeenCalledWith('npx', ['cdk', 'deploy'], {
-            cwd: resolvedCwd,
-            stdio: 'inherit',
-        });
+        expect(spawnSync).toHaveBeenCalledTimes(1);
+        const [cmd, args, opts] = spawnSync.mock.calls[0];
+        expect([cmd, args]).toEqual(['npx', ['cdk', verb]]);
+        expect(opts.cwd).toBe(cwd);
+        expect(opts.stdio).toBe('inherit');
+        expect(opts.env.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
         expect(resolvePipeline).not.toHaveBeenCalled();
-        expect(startPipelineRun).not.toHaveBeenCalled();
-        expect(describePipelineRun).not.toHaveBeenCalled();
+        expect(stderr()).toContain('[aws] account 123456789012 (controlled)');
     });
 
-    test('errors loudly instead of deploying when <name> does not match ./config/default.json', async () => {
-        tempDir = writeTempPipelineConfig({
-            environment: 'dev',
-            workloadName: 'bedrock-docs',
+    test('exits 2 when <name> does not match ./config/default.json', async () => {
+        enter();
+        await expect(
+            run({ name: 'prod-other-pipeline' }),
+        ).rejects.toMatchObject({
+            exitCode: 2,
+            message: /doesn't match this directory's pipeline/,
         });
-        originalCwd = process.cwd();
-        process.chdir(tempDir);
-
-        const cmd = new PipelineDeployCommand({ name: 'prod-other-pipeline' });
-        await expect(cmd.execute()).rejects.toThrow(
-            /doesn't match this directory's pipeline/,
-        );
         expect(spawnSync).not.toHaveBeenCalled();
+        expect(getCallerAccount).not.toHaveBeenCalled();
     });
 
-    test('errors loudly when run outside a pipeline repo (no ./config/default.json)', async () => {
+    test('exits 2 outside a pipeline repo (no ./config/default.json)', async () => {
         tempDir = fs.mkdtempSync(
             path.join(os.tmpdir(), 'ari-pipeline-deploy-empty-'),
         );
         originalCwd = process.cwd();
         process.chdir(tempDir);
-
-        const cmd = new PipelineDeployCommand({ name: 'dev-bedrock-docs' });
-        await expect(cmd.execute()).rejects.toThrow('Could not read');
+        await expect(run()).rejects.toMatchObject({
+            exitCode: 2,
+            message: /Could not read/,
+        });
         expect(spawnSync).not.toHaveBeenCalled();
     });
 
-    test('propagates a non-zero "cdk deploy" exit code as an error', async () => {
+    test('exits 2 and does not spawn cdk on an account mismatch', async () => {
+        enter();
+        getCallerAccount.mockResolvedValueOnce('999999999999');
+        await expect(run()).rejects.toMatchObject({
+            exitCode: 2,
+            message: /belongs to the "controlled" account/,
+        });
+        expect(spawnSync).not.toHaveBeenCalled();
+    });
+
+    test('fails closed (exit 2) when ~/.ari/config.json has no id for the account', async () => {
+        enter();
+        readLocalConfig.mockReturnValueOnce({ accounts: {} });
+        await expect(run()).rejects.toMatchObject({
+            exitCode: 2,
+            message: /Run: ari init/,
+        });
+        expect(getCallerAccount).not.toHaveBeenCalled();
+        expect(spawnSync).not.toHaveBeenCalled();
+    });
+
+    test('exits 2 when iac.account / iac.region is missing', async () => {
+        enter({ account: null });
+        await expect(run()).rejects.toMatchObject({ exitCode: 2 });
+        expect(spawnSync).not.toHaveBeenCalled();
+    });
+
+    test('exits 2 when AWS_REGION disagrees with iac.region', async () => {
+        enter();
+        process.env.AWS_REGION = 'eu-west-1';
+        try {
+            await expect(run()).rejects.toMatchObject({
+                exitCode: 2,
+                message: /AWS_REGION/,
+            });
+        } finally {
+            delete process.env.AWS_REGION;
+        }
+        expect(spawnSync).not.toHaveBeenCalled();
+    });
+
+    test('propagates a non-zero cdk exit code as exit 1', async () => {
+        enter();
+        spawnSync.mockReturnValueOnce({ status: 1, error: null });
+        await expect(run()).rejects.toMatchObject({
+            exitCode: 1,
+            message: `"npx cdk ${verb}" exited with code 1`,
+        });
+    });
+});
+
+describe('bootstrap check and deploy options', () => {
+    let originalCwd;
+    let tempDir;
+    const enter = (opts = {}) => {
         tempDir = writeTempPipelineConfig({
             environment: 'dev',
             workloadName: 'bedrock-docs',
+            ...opts,
         });
         originalCwd = process.cwd();
         process.chdir(tempDir);
-        spawnSync.mockReturnValueOnce({ status: 1, error: null });
+    };
+    const deploy = (options = {}) =>
+        new PipelineDeployCommand({
+            name: 'dev-bedrock-docs',
+            ...options,
+        }).execute();
+    const spawned = () => spawnSync.mock.calls.map((c) => c[1]);
 
-        const cmd = new PipelineDeployCommand({ name: 'dev-bedrock-docs' });
-        await expect(cmd.execute()).rejects.toThrow(
-            '"npx cdk deploy" exited with code 1',
+    afterEach(() => {
+        if (originalCwd) process.chdir(originalCwd);
+        if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+        originalCwd = undefined;
+        tempDir = undefined;
+    });
+
+    test('missing bootstrap parameter -> exit 2 with both remedies, cdk not spawned', async () => {
+        enter();
+        getBootstrapVersion.mockResolvedValueOnce(null);
+        await expect(deploy()).rejects.toMatchObject({
+            exitCode: 2,
+            message: expect.stringMatching(
+                /ari pipeline deploy dev-bedrock-docs --bootstrap.*npx cdk bootstrap aws:\/\/123456789012\/us-east-1/,
+            ),
+        });
+        expect(getBootstrapVersion).toHaveBeenCalledWith(
+            'hnb659fds',
+            'us-east-1',
         );
+        expect(spawnSync).not.toHaveBeenCalled();
+    });
+
+    test('reads the qualifier from cdk.json context', async () => {
+        enter({
+            cdkJson: {
+                context: { '@aws-cdk/core:bootstrapQualifier': 'custom1' },
+            },
+        });
+        await deploy();
+        expect(getBootstrapVersion).toHaveBeenCalledWith(
+            'custom1',
+            'us-east-1',
+        );
+    });
+
+    test('rejects a malformed qualifier (exit 2)', async () => {
+        enter({
+            cdkJson: {
+                context: { '@aws-cdk/core:bootstrapQualifier': '../x' },
+            },
+        });
+        await expect(deploy()).rejects.toMatchObject({ exitCode: 2 });
+        expect(spawnSync).not.toHaveBeenCalled();
+    });
+
+    test('--bootstrap confirms, then spawns bootstrap before deploy', async () => {
+        enter();
+        await deploy({ bootstrap: true });
+        expect(confirm).toHaveBeenCalledTimes(1);
+        expect(spawned()).toEqual([
+            ['cdk', 'bootstrap', 'aws://123456789012/us-east-1'],
+            ['cdk', 'deploy'],
+        ]);
+    });
+
+    test('--bootstrap declined -> exit 2, nothing spawned', async () => {
+        enter();
+        confirm.mockResolvedValueOnce(false);
+        await expect(deploy({ bootstrap: true })).rejects.toMatchObject({
+            exitCode: 2,
+        });
+        expect(spawnSync).not.toHaveBeenCalled();
+    });
+
+    test('--bootstrap off a TTY needs --yes', async () => {
+        enter();
+        isInteractive.mockReturnValueOnce(false);
+        await expect(deploy({ bootstrap: true })).rejects.toMatchObject({
+            exitCode: 2,
+            message: /--yes/,
+        });
+        expect(spawnSync).not.toHaveBeenCalled();
+
+        isInteractive.mockReturnValue(false);
+        await deploy({ bootstrap: true, yes: true });
+        isInteractive.mockReturnValue(true);
+        expect(confirm).not.toHaveBeenCalled();
+        expect(spawned()[0][1]).toBe('bootstrap');
+    });
+
+    test('--require-approval passes through to cdk', async () => {
+        enter();
+        await deploy({ requireApproval: 'any-change' });
+        expect(spawned()).toEqual([
+            ['cdk', 'deploy', '--require-approval', 'any-change'],
+        ]);
+    });
+
+    test('--require-approval never warns, and off a TTY needs --yes', async () => {
+        enter();
+        isInteractive.mockReturnValue(false);
+        await expect(
+            deploy({ requireApproval: 'never' }),
+        ).rejects.toMatchObject({ exitCode: 2, message: /--yes/ });
+        expect(spawnSync).not.toHaveBeenCalled();
+
+        await deploy({ requireApproval: 'never', yes: true });
+        isInteractive.mockReturnValue(true);
+        expect(stderr()).toContain('NOT be confirmed');
+        expect(spawned()).toEqual([
+            ['cdk', 'deploy', '--require-approval', 'never'],
+        ]);
+    });
+
+    test('an unknown --require-approval value is rejected', async () => {
+        enter();
+        await expect(
+            deploy({ requireApproval: 'whatever' }),
+        ).rejects.toMatchObject({ exitCode: 2 });
+        expect(spawnSync).not.toHaveBeenCalled();
+    });
+
+    test('diff checks bootstrap; synth does not and passes --quiet', async () => {
+        enter();
+        getBootstrapVersion.mockResolvedValueOnce(null);
+        await expect(
+            new PipelineDiffCommand({ name: 'dev-bedrock-docs' }).execute(),
+        ).rejects.toMatchObject({ exitCode: 2 });
+
+        getBootstrapVersion.mockClear();
+        await new PipelineSynthCommand({
+            name: 'dev-bedrock-docs',
+            quiet: true,
+        }).execute();
+        expect(getBootstrapVersion).not.toHaveBeenCalled();
+        expect(spawned()).toEqual([['cdk', 'synth', '--quiet']]);
     });
 });
 
@@ -745,7 +969,11 @@ describe('PipelineLogsCommand', () => {
 
         test('reads the manifest, fetches the manifest log groups for this run, and prints the interleave notice once', async () => {
             fetchLambdaLogs.mockResolvedValueOnce({
-                events: [lambdaEvent('09:00:01 lambda:file-step-runner REPORT duration=12ms')],
+                events: [
+                    lambdaEvent(
+                        '09:00:01 lambda:file-step-runner REPORT duration=12ms',
+                    ),
+                ],
                 truncated: false,
             });
             await setup(PipelineLogsCommand, {
@@ -766,20 +994,28 @@ describe('PipelineLogsCommand', () => {
                 'us-east-1',
             );
             expect(fetchExecutionLogs).not.toHaveBeenCalled();
-            expect(stdout()).toContain('lambda:file-step-runner REPORT duration=12ms');
+            expect(stdout()).toContain(
+                'lambda:file-step-runner REPORT duration=12ms',
+            );
             expect(stderr().match(/concurrent runs/g)).toHaveLength(1);
             expect(stderr()).toContain('request id, not a run id');
         });
 
-        test('passes the finished execution\'s stop time (plus grace) as the window end', async () => {
+        test("passes the finished execution's stop time (plus grace) as the window end", async () => {
             describePipelineRun.mockResolvedValueOnce({
                 status: 'SUCCEEDED',
                 executionArn: EXEC_ARN,
                 startDate: new Date('2026-10-04T12:00:00.000Z'),
                 stopDate: new Date('2026-10-04T12:05:00.000Z'),
             });
-            fetchLambdaLogs.mockResolvedValueOnce({ events: [], truncated: false });
-            await setup(PipelineLogsCommand, { runId: 'r1', source: 'lambda' }).execute();
+            fetchLambdaLogs.mockResolvedValueOnce({
+                events: [],
+                truncated: false,
+            });
+            await setup(PipelineLogsCommand, {
+                runId: 'r1',
+                source: 'lambda',
+            }).execute();
             const args = fetchLambdaLogs.mock.calls[0][0];
             expect(args.startTime).toBe(Date.parse('2026-10-04T12:00:00.000Z'));
             expect(args.endTime).toBe(Date.parse('2026-10-04T12:05:10.000Z'));
@@ -787,17 +1023,25 @@ describe('PipelineLogsCommand', () => {
 
         test('a missing manifest is a clear error and nothing is fetched', async () => {
             getPipelineManifest.mockRejectedValueOnce(
-                new PipelineError('"dev-bedrock-docs" has no manifest ... redeploy'),
+                new PipelineError(
+                    '"dev-bedrock-docs" has no manifest ... redeploy',
+                ),
             );
             await expect(
-                setup(PipelineLogsCommand, { runId: 'r1', source: 'lambda' }).execute(),
+                setup(PipelineLogsCommand, {
+                    runId: 'r1',
+                    source: 'lambda',
+                }).execute(),
             ).rejects.toThrow(/no manifest/);
             expect(fetchLambdaLogs).not.toHaveBeenCalled();
             expect(fetchExecutionLogs).not.toHaveBeenCalled();
         });
 
         test('--source sfn never reads the manifest or prints the interleave notice', async () => {
-            fetchExecutionLogs.mockResolvedValueOnce({ events: [], truncated: false });
+            fetchExecutionLogs.mockResolvedValueOnce({
+                events: [],
+                truncated: false,
+            });
             await setup(PipelineLogsCommand, { runId: 'r1' }).execute();
             expect(getPipelineManifest).not.toHaveBeenCalled();
             expect(stderr()).not.toContain('concurrent runs');
@@ -809,21 +1053,32 @@ describe('PipelineLogsCommand', () => {
                     {
                         eventId: 's1',
                         timestamp: Date.UTC(2026, 9, 14, 9, 0, 0),
-                        message: JSON.stringify({ type: 'TaskStateEntered', details: { name: 'parse-file' } }),
+                        message: JSON.stringify({
+                            type: 'TaskStateEntered',
+                            details: { name: 'parse-file' },
+                        }),
                     },
                     {
                         eventId: 's2',
                         timestamp: Date.UTC(2026, 9, 14, 9, 0, 5),
-                        message: JSON.stringify({ type: 'TaskStateExited', details: { name: 'parse-file' } }),
+                        message: JSON.stringify({
+                            type: 'TaskStateExited',
+                            details: { name: 'parse-file' },
+                        }),
                     },
                 ],
                 truncated: false,
             });
             fetchLambdaLogs.mockResolvedValueOnce({
-                events: [lambdaEvent('LAMBDA-LINE', Date.UTC(2026, 9, 14, 9, 0, 3))],
+                events: [
+                    lambdaEvent('LAMBDA-LINE', Date.UTC(2026, 9, 14, 9, 0, 3)),
+                ],
                 truncated: false,
             });
-            await setup(PipelineLogsCommand, { runId: 'r1', source: 'all' }).execute();
+            await setup(PipelineLogsCommand, {
+                runId: 'r1',
+                source: 'all',
+            }).execute();
             const lines = logSpy.mock.calls.map((c) => c[0]);
             expect(lines).toHaveLength(3);
             expect(lines[0]).toContain('TaskStateEntered parse-file');
@@ -836,15 +1091,32 @@ describe('PipelineLogsCommand', () => {
                 events: [lambdaEvent('LAMBDA-LINE')],
                 truncated: false,
             });
-            await setup(PipelineLogsCommand, { runId: 'r1', source: 'lambda', json: true }).execute();
+            await setup(PipelineLogsCommand, {
+                runId: 'r1',
+                source: 'lambda',
+                json: true,
+            }).execute();
             const parsed = JSON.parse(logSpy.mock.calls[0][0]);
-            expect(parsed).toEqual({ timestamp: '2026-10-14T09:00:01.000Z', line: 'LAMBDA-LINE' });
+            expect(parsed).toEqual({
+                timestamp: '2026-10-14T09:00:01.000Z',
+                line: 'LAMBDA-LINE',
+            });
         });
 
         test('--follow with lambda hands the follow loop one source per group (plus sfn for all)', async () => {
-            followExecutionLogs.mockResolvedValueOnce({ outcome: 'done', exitCode: 0, status: 'SUCCEEDED' });
-            await setup(PipelineLogsCommand, { runId: 'r1', source: 'all', follow: true }).execute();
-            expect(lambdaLogSources).toHaveBeenCalledWith(GROUPS, 'r1', { full: undefined });
+            followExecutionLogs.mockResolvedValueOnce({
+                outcome: 'done',
+                exitCode: 0,
+                status: 'SUCCEEDED',
+            });
+            await setup(PipelineLogsCommand, {
+                runId: 'r1',
+                source: 'all',
+                follow: true,
+            }).execute();
+            expect(lambdaLogSources).toHaveBeenCalledWith(GROUPS, 'r1', {
+                full: undefined,
+            });
             const [args] = followExecutionLogs.mock.calls[0];
             expect(args.sources.map((x) => x.id)).toEqual(['sfn', 'lambda:x']);
         });

@@ -3,6 +3,8 @@ import {
     PipelineRunCommand,
     PipelineStatusCommand,
     PipelineDeployCommand,
+    PipelineDiffCommand,
+    PipelineSynthCommand,
     PipelineWaitCommand,
     PipelineRunsCommand,
     PipelineStopCommand,
@@ -43,6 +45,21 @@ export async function runCommand(CommandClass, options) {
  * @param {string} options.name
  */
 export const deploy = (options) => runCommand(PipelineDeployCommand, options);
+
+/**
+ * `ari pipeline diff <name>` — guarded `cdk diff`; same cwd rules as deploy.
+ * @param {Object} options
+ * @param {string} options.name
+ */
+export const diff = (options) => runCommand(PipelineDiffCommand, options);
+
+/**
+ * `ari pipeline synth <name>` — guarded `cdk synth`; same cwd rules as deploy.
+ * @param {Object} options
+ * @param {string} options.name
+ * @param {boolean} [options.quiet]
+ */
+export const synth = (options) => runCommand(PipelineSynthCommand, options);
 
 /**
  * `ari pipeline run <name>` — starts an execution of a named pipeline.
