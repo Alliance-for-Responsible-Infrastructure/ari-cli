@@ -1,7 +1,7 @@
 {
     "credentials": {
         "defaultRole": "ViewOnlyAccess",
-        "roles": ["AdministratorAccess", "ViewOnlyAccess"],
+        "roles": ["AdministratorAccess", "ViewOnlyAccess", "S3ReadWrite"],
         "accounts": {
             "management": { "name": "ARI Management" },
             "controlled": { "name": "ari-controlled" },
